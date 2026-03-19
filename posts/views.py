@@ -9,17 +9,41 @@ from .models import PostLike, Post, Comment
 
 
 
+from django.db.models import Count, Exists, OuterRef
+from rest_framework import generics, permissions
+from .models import Post, PostLike
+from .serializers import PostSerializer
+
 class PostListCreateView(generics.ListCreateAPIView):
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         """
-        Optionally filter posts by league or team using query parameters:
-        /api/posts/?league=1
-        /api/posts/?league=1&team=3
+        Optimized queryset to fetch user identity (team/league) 
+        and engagement counts in a single database hit.
         """
-        queryset = Post.objects.all()
+        user = self.request.user
+        
+        # 1. Start with select_related to 'JOIN' the User, Team, and League tables
+        # This is what makes author_details.favorite_team_name work instantly.
+        queryset = Post.objects.select_related(
+            'author', 
+            'author__favorite_team', 
+            'author__favorite_league'
+        ).annotate(
+            # 2. Add counts for engagement metrics
+            likes_count=Count('likes', distinct=True),
+            comments_count=Count('comments', distinct=True),
+            shares_count=Count('shares', distinct=True),
+        )
+
+        # 3. Optimization: Check if the logged-in user liked the post
+        if user.is_authenticated:
+            user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
+            queryset = queryset.annotate(user_has_liked=Exists(user_likes))
+
+        # 4. Apply filters for the Sidebar/Drawer navigation
         league_id = self.request.query_params.get('league')
         team_id = self.request.query_params.get('team')
 
@@ -27,11 +51,13 @@ class PostListCreateView(generics.ListCreateAPIView):
             queryset = queryset.filter(league_id=league_id)
         if team_id:
             queryset = queryset.filter(team_id=team_id)
-        return queryset
+
+        # 5. Always show newest posts first
+        return queryset.order_by('-created_at')
 
     def perform_create(self, serializer):
+        # Automatically set the author to the logged-in user
         serializer.save(author=self.request.user)
-
 
 class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Post.objects.all()

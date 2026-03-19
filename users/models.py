@@ -71,3 +71,19 @@ class FanPreference(models.Model):
 
     def __str__(self):
         return f"{self.user.username} - {self.team.name}"
+
+
+
+
+
+class Profile(models.Model):
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="users_Profile_user"
+    )
+    display_name = models.CharField(max_length=50, blank=True)
+    bio = models.TextField(max_length=500, blank=True)
+    profile_image = models.ImageField(upload_to='profiles/', null=True, blank=True)
+    banner_image = models.ImageField(upload_to='banners/', null=True, blank=True)

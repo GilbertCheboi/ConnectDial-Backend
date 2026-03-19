@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-ju@9x-5kr06)yt7b0pc$4bi$&m#^=wnmnhgi3^o+$07v*e+j+s
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['192.168.100.108', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['192.168.100.107', 'localhost', '127.0.0.1', '10.126.232.156']
 
 AUTH_USER_MODEL = 'users.User'
 
@@ -63,7 +63,6 @@ INSTALLED_APPS = [
     'leagues',
     'posts',
     'feeds',
-    'media',
     'notifications',
     'search',
     'trending',
@@ -169,10 +168,11 @@ REST_USE_JWT = True
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework.authentication.TokenAuthentication', # Add this line
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.AllowAny',
+        'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
@@ -196,3 +196,12 @@ SOCIALACCOUNT_PROVIDERS = {
     },
 }
 
+REST_AUTH = {
+    'USE_JWT': False,
+    'USER_DETAILS_SERIALIZER': 'users.serializers.UserSerializer',
+    # ADD THIS LINE:
+    'LOGIN_SERIALIZER': 'users.serializers.CustomLoginSerializer',
+}
+
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'

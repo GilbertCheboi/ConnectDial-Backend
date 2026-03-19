@@ -1,138 +1,73 @@
 from rest_framework import serializers
-from posts.models import Post, PostLike, PostShare, Comment
+from django.contrib.auth import get_user_model
+from posts.models import Post, Comment
+from users.models import FanPreference
+User = get_user_model()
 
+class UserMiniSerializer(serializers.ModelSerializer):
+    """Basic author info for the header"""
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'fan_badge']
 
-class PostSerializer(serializers.ModelSerializer):
+class SupportLogicMixin:
+    """
+    Reusable logic for both Posts and Comments to find which 
+    team the user supports in the specific league of the content.
+    """
+    def get_supporting_info(self, obj):
+        # 'obj' is either a Post or a Comment
+        author = obj.author if hasattr(obj, 'author') else obj.user
+        
+        # We need the league of the post to filter the user's teams
+        # If it's a comment, we look at the parent post's league
+        target_league = getattr(obj, 'league', None)
+        if not target_league and hasattr(obj, 'post'):
+            target_league = obj.post.league
 
-    # Author identity
-    author_username = serializers.CharField(source='author.username', read_only=True)
-    author_fan_badge = serializers.CharField(source='author.fan_badge', read_only=True)
+        if not target_league:
+            return None
 
-    # League / Team names
-    league_name = serializers.CharField(source='league.name', read_only=True)
-    team_name = serializers.CharField(source='team.name', read_only=True)
+        # Look for the specific team this user picked for THIS league
+        pref = author.fan_preferences.filter(league=target_league).select_related('team', 'league').first()
+        
+        if pref:
+            return {
+                "team_name": pref.team.name,
+                "league_name": pref.league.name,
+                "text": f"Supports {pref.team.name}"
+            }
+        return None
 
-    # Engagement counts
-    likes_count = serializers.IntegerField(source='likes.count', read_only=True)
-    comments_count = serializers.IntegerField(source='comments.count', read_only=True)
-    shares_count = serializers.IntegerField(source='shares.count', read_only=True)
-
+class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
+    author_details = UserMiniSerializer(source='author', read_only=True)
+    supporting_info = serializers.SerializerMethodField()
+    
+    likes_count = serializers.IntegerField(read_only=True, default=0)
+    comments_count = serializers.IntegerField(read_only=True, default=0)
     liked_by_me = serializers.SerializerMethodField()
 
     class Meta:
         model = Post
         fields = [
-            'id',
-            'author',
-            'author_username',
-            'author_fan_badge',
-
-            'content',
-            'post_type',
-            'media_file',
-
-            'league',
-            'league_name',
-
-            'team',
-            'team_name',
-
-            'likes_count',
-            'comments_count',
-            'shares_count',
-            'liked_by_me',
-
-            'created_at',
-            'updated_at',
-        ]
-
-        read_only_fields = [
-            'id',
-            'author',
-            'author_username',
-            'author_fan_badge',
-            'league_name',
-            'team_name',
-            'likes_count',
-            'comments_count',
-            'shares_count',
-            'liked_by_me',
-            'created_at',
-            'updated_at',
+            'id', 'author_details', 'content', 'post_type', 'media_file',
+            'league', 'supporting_info', 'likes_count', 'comments_count', 
+            'liked_by_me', 'created_at'
         ]
 
     def get_liked_by_me(self, obj):
         request = self.context.get("request")
-
         if request and request.user.is_authenticated:
             return obj.likes.filter(user=request.user).exists()
-
         return False
 
-
-# ------------------------------------
-# Comment Serializer
-# ------------------------------------
-
-class CommentSerializer(serializers.ModelSerializer):
-
-    author_username = serializers.CharField(source='user.username', read_only=True)
-    author_fan_badge = serializers.CharField(source='user.fan_badge', read_only=True)
-
-    league_name = serializers.SerializerMethodField()
-    team_name = serializers.SerializerMethodField()
-
-    likes_count = serializers.IntegerField(source='likes.count', read_only=True)
-    liked_by_me = serializers.SerializerMethodField()
+class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
+    author_details = UserMiniSerializer(source='user', read_only=True)
+    supporting_info = serializers.SerializerMethodField()
 
     class Meta:
         model = Comment
-
         fields = [
-            'id',
-            'post',
-            'user',
-
-            'author_username',
-            'author_fan_badge',
-
-            'content',
-
-            'league_name',
-            'team_name',
-
-            'likes_count',
-            'liked_by_me',
-
-            'created_at',
+            'id', 'post', 'author_details', 'content', 
+            'supporting_info', 'created_at'
         ]
-
-        read_only_fields = [
-            'id',
-            'user',
-            'author_username',
-            'author_fan_badge',
-            'league_name',
-            'team_name',
-            'likes_count',
-            'liked_by_me',
-            'created_at',
-        ]
-
-    def get_league_name(self, obj):
-        if obj.user.favorite_league:
-            return obj.user.favorite_league.name
-        return None
-
-    def get_team_name(self, obj):
-        if obj.user.favorite_team:
-            return obj.user.favorite_team.name
-        return None
-
-    def get_liked_by_me(self, obj):
-        request = self.context.get("request")
-
-        if request and request.user.is_authenticated:
-            return obj.likes.filter(user=request.user).exists()
-
-        return False
