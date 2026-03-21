@@ -34,6 +34,15 @@ class Post(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_short = models.BooleanField(default=False)
+    parent_post = models.ForeignKey(
+        'self', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='reposts'
+    )
+    is_repost = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-created_at']
@@ -68,6 +77,7 @@ class Comment(models.Model):
     )
     content = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
+
 
 
 class CommentLike(models.Model):

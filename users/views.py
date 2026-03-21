@@ -44,10 +44,15 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def get_object(self):
-        """
-        Retrieves the profile for the currently authenticated user.
-        Uses get_or_create to ensure a profile exists even if signals failed.
-        """
+        # This is the "secret sauce" for viewing other profiles
+        user_id = self.request.query_params.get('user_id')
+        
+        if user_id:
+            # If the frontend sent ?user_id=X, find that profile
+            profile, created = Profile.objects.get_or_create(user_id=user_id)
+            return profile
+        
+        # Otherwise, return the logged-in user's profile
         profile, created = Profile.objects.get_or_create(user=self.request.user)
         return profile
 

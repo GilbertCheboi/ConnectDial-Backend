@@ -205,3 +205,8 @@ REST_AUTH = {
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# settings.py
+
+# This prevents Django from trying to connect to a non-existent SMTP server
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'

@@ -40,8 +40,14 @@ class UserSerializer(serializers.ModelSerializer):
         # return has_prefs and has_profile
         
         return has_prefs
-class OnboardingSerializer(serializers.Serializer):
+
+
+class OnboardingSerializer(serializers.ModelSerializer):
     fan_preferences = FanPreferenceSerializer(many=True)
+
+    class Meta:
+        model = User  # Ensure your User model is linked here
+        fields = ['fan_preferences'] # Add other fields as needed
 
     def validate(self, data):
         # Ensure one team per league
@@ -51,9 +57,10 @@ class OnboardingSerializer(serializers.Serializer):
             raise serializers.ValidationError("You can only select one team per league.")
         return data
 
-def create(self, validated_data):
+    def create(self, validated_data):
+        # This MUST be indented inside the class
         user = self.context['request'].user
-        fan_preferences_data = validated_data['fan_preferences']
+        fan_preferences_data = validated_data.pop('fan_preferences', [])
 
         # 1. Delete old preferences
         user.fan_preferences.all().delete()
@@ -66,22 +73,17 @@ def create(self, validated_data):
                 team=fp['team']
             )
 
-        # --- THE FIX IS HERE ---
-        # 3. Update the main User model fields so PostSerializer can see them
+        # 3. Update the main User model fields
         if fan_preferences_data:
-            # We take the first preference as the "Main" identity
             primary_pref = fan_preferences_data[0]
             user.favorite_team = primary_pref['team']
             user.favorite_league = primary_pref['league']
-            
-            # 4. Update the fan_badge from the default string
             user.fan_badge = f"{primary_pref['team'].name} Fan"
-            
-            user.save() # This commits it to the users_user table
+            user.save() 
 
         return user
 
-        from rest_framework import serializers
+from rest_framework import serializers
 
 class ProfileSerializer(serializers.ModelSerializer):
     # We make these read_only=False so the frontend can update them

@@ -1,10 +1,17 @@
-from django.urls import path
-from .views import PostListCreateView, PostDetailView, FollowingFeedView
+# posts/urls.py
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+from .views import PostViewSet, CommentViewSet, ShortVideoViewSet
+
+router = DefaultRouter()
+
+# 🚀 STEP 1: Register specific endpoints FIRST
+router.register(r'shorts', ShortVideoViewSet, basename='short')
+router.register(r'comments', CommentViewSet, basename='comment')
+
+# 🚀 STEP 2: Register the catch-all PostViewSet LAST
+router.register(r'', PostViewSet, basename='post') 
 
 urlpatterns = [
-    path('', PostListCreateView.as_view(), name='post-list-create'),
-    path('<int:pk>/', PostDetailView.as_view(), name='post-detail'),
-    path('feed/following/', FollowingFeedView.as_view(), name='following-feed'),
-
+    path('', include(router.urls)),
 ]
-
