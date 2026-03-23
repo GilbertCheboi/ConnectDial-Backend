@@ -1,12 +1,18 @@
 from rest_framework import serializers
 from .models import User, FanPreference
 from leagues.models import League, Team
-from .models import Profile
+from .models import Profile, Follow  # Ensure you have a Follow model for the following logic
 # For returning existing preferences
+# In Django serializers.py
 class FanPreferenceSerializer(serializers.ModelSerializer):
+    league_name = serializers.ReadOnlyField(source='league.name')
+    team_name = serializers.ReadOnlyField(source='team.name')
+
     class Meta:
         model = FanPreference
-        fields = ['league', 'team']
+        fields = ['league', 'team', 'league_name', 'team_name']
+
+        
 from rest_framework import serializers
 from .models import FanPreference, Profile  # Ensure correct imports
 
@@ -83,18 +89,54 @@ class OnboardingSerializer(serializers.ModelSerializer):
 
         return user
 
-from rest_framework import serializers
+    def update(self, instance, validated_data):
+    # 1. Get the list of new preferences from the request
+        new_preferences = validated_data.get('fan_preferences', [])
+    
+    # 2. Check the flag we sent from React Native
+        append_mode = self.initial_data.get('append_mode', False)
+
+    # 3. Handle the logic
+        if not append_mode:
+        # If NOT in append mode (Onboarding), clear old preferences first
+               instance.fan_preferences.all().delete()
+
+    # 4. Add the new ones
+        for pref in new_preferences:
+        # Logic to create or update the preference
+        # e.g., FanPreference.objects.update_or_create(user=instance, league=pref['league'], defaults={'team': pref['team']})
+          pass
+        
+        return instance
 
 class ProfileSerializer(serializers.ModelSerializer):
-    # We make these read_only=False so the frontend can update them
+    # 🚀 Add these lines to pull data from the related User model
+    username = serializers.ReadOnlyField(source='user.username')
+    fan_preferences = FanPreferenceSerializer(source='user.fan_preferences', many=True, read_only=True)
+    is_following = serializers.SerializerMethodField()
+    followers_count = serializers.SerializerMethodField()
+    following_count = serializers.SerializerMethodField()
+    
     class Meta:
         model = Profile
-        fields = ['display_name', 'bio', 'profile_image', 'banner_image']
+        # 🚀 Add 'username' and 'fan_preferences' to the fields
+        fields = ['display_name', 'bio', 'profile_image', 'banner_image', 'fcm_token', 'username', 'fan_preferences', 'is_following', 'followers_count', 'following_count']
 
     def update(self, instance, validated_data):
-        # This ensures images are only overwritten if new ones are provided
         return super().update(instance, validated_data)
 
+    def get_is_following(self, obj):
+        request = self.context.get('request')
+        if request and request.user.is_authenticated:
+            # Check if the logged-in user follows the owner of THIS profile
+            return Follow.objects.filter(follower=request.user, followed=obj.user).exists()
+        return False
+
+    def get_followers_count(self, obj):
+        return obj.user.followers.count()
+
+    def get_following_count(self, obj):
+        return obj.user.following.count()
 
 from dj_rest_auth.serializers import LoginSerializer
 

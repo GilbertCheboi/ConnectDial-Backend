@@ -1,16 +1,15 @@
 from rest_framework import generics,viewsets, permissions, status
 from .serializers import PostSerializer, CommentSerializer
-from feeds.models import UserFollow, TeamFollow, LeagueFollow
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from .models import PostLike, Post, Comment
 
 from rest_framework.decorators import action
+from users.models import Follow
 
 
-
-from django.db.models import Count, Exists, OuterRef
+from django.db.models import Q, Count, OuterRef, Exists
 from rest_framework import generics, permissions
 from .models import Post, PostLike
 from .serializers import PostSerializer
@@ -51,54 +50,89 @@ class CommentViewSet(viewsets.ModelViewSet):
         return Response({"message": "Comment deleted"}, status=status.HTTP_204_NO_CONTENT)
 
 
+
 class PostViewSet(viewsets.ModelViewSet):
     serializer_class = PostSerializer
-    permission_class = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
 
     def get_queryset(self):
         user = self.request.user
         
-        # Optimized JOINs and Annotations
+        # 1. Base Queryset with Correct Optimization
         queryset = Post.objects.select_related(
             'author', 
-            'author__favorite_team', 
-            'author__favorite_league'
+            'parent_post',                
+            'parent_post__author',        
+        ).prefetch_related(
+            'author__profile',
+            'parent_post__author__profile',
         ).annotate(
             likes_count=Count('likes', distinct=True),
             comments_count=Count('comments', distinct=True),
             shares_count=Count('shares', distinct=True),
+            reposts_count=Count('quoted_by', distinct=True),
         )
 
+        # 2. Add "liked_by_me" logic
         if user.is_authenticated:
-            # Note: Ensure PostLike and OuterRef/Exists are imported
             user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
             queryset = queryset.annotate(user_has_liked=Exists(user_likes))
 
-        # --- NEW FILTERING LOGIC FOR PROFILES ---
+        # --- 3. EXTRACTION OF PARAMS ---
         user_id = self.request.query_params.get('user')
         filter_type = self.request.query_params.get('filter')
+        league_id = self.request.query_params.get('league')
+        leagues_list = self.request.query_params.get('leagues') 
+        team_id = self.request.query_params.get('team')
+        feed_type = self.request.query_params.get('feed_type') # 🚀 NEW: global vs following
 
-        if user_id:
-            # This handles clicking on "Other" profiles
+        # --- 4. FILTERING LOGIC ---
+
+        # A. Personalized Following Feed (The "Home" Feed)
+        if feed_type == 'following' and user.is_authenticated:
+            # Get the list of user IDs that the current user follows
+            following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
+            # Include user's own posts in their following feed
+            queryset = queryset.filter(author_id__in=list(following_ids) + [user.id])
+
+        # B. Profile View Logic
+        elif user_id:
             queryset = queryset.filter(author_id=user_id)
         elif filter_type == 'mine' and user.is_authenticated:
-            # This handles your own "My Profile" tab
             queryset = queryset.filter(author=user)
-        # --- END OF PROFILE LOGIC ---
 
-        # Existing Sidebar/Drawer filters
-        league_id = self.request.query_params.get('league')
-        team_id = self.request.query_params.get('team')
-
-        if league_id:
+        # C. Specific League/Team (Drawer Navigation)
+        elif league_id:
             queryset = queryset.filter(league_id=league_id)
-        if team_id:
+        elif team_id:
             queryset = queryset.filter(team_id=team_id)
 
+        # D. The Hard Filter (Onboarding preferences)
+        elif leagues_list:
+            try:
+                ids = [int(x) for x in leagues_list.split(',') if x.strip().isdigit()]
+                queryset = queryset.filter(league_id__in=ids)
+            except ValueError:
+                pass
+        
+        # If feed_type is 'global' or no filters match, it returns the full optimized queryset
+        return queryset.order_by('-created_at')
+        
         return queryset.order_by('-created_at')
     def perform_create(self, serializer):
-        # Automatically assign the author on creation
-        serializer.save(author=self.request.user)
+        # 1. Get the parent_post ID from the request (sent by Quote logic)
+        parent_id = self.request.data.get('parent_post')
+        
+        if parent_id:
+            # 2. Save the post linked to the original post
+            # We use parent_post_id to avoid an extra database lookup
+            serializer.save(
+                author=self.request.user, 
+                parent_post_id=parent_id
+            )
+        else:
+            # 3. Standard post creation
+            serializer.save(author=self.request.user)
 
     def destroy(self, request, *args, **kwargs):
         """
@@ -130,7 +164,11 @@ class PostViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_200_OK)  
 
      
-    @action(detail=True, methods=['get', 'post'])
+    @action(
+        detail=True, 
+        methods=['get', 'post'], 
+        permission_classes=[permissions.IsAuthenticated] # 🚀 OVERRIDE HERE
+    )
     def comments(self, request, pk=None):
         post = self.get_object()
 
@@ -149,24 +187,43 @@ class PostViewSet(viewsets.ModelViewSet):
             serializer = CommentSerializer(comments, many=True, context={'request': request})
             return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
     def repost(self, request, pk=None):
         original_post = self.get_object()
         
-        # 🚀 THE FIX: Get the league from the original post
-        # Adjust 'league' to match whatever your field name is (e.g., league_id)
-        original_league = getattr(original_post, 'league', None)
+        # 1. Prevent duplicate simple reposts (optional but recommended)
+        existing_repost = Post.objects.filter(
+            author=request.user, 
+            parent_post=original_post, 
+            content='' # Simple reposts have no content
+        ).first()
 
+        if existing_repost:
+            # If they click it again, they might want to "Undo" the repost
+            existing_repost.delete()
+            return Response({
+                'status': 'unreposted',
+                'reposts_count': Post.objects.filter(parent_post=original_post).count()
+            }, status=200)
+
+        # 2. Create the Repost
         repost = Post.objects.create(
             author=request.user,
-            content=request.data.get('content', ''), # Optional commentary
+            content='', 
             parent_post=original_post,
-            is_repost=True,
-            league=original_league  # 👈 Pass the league here to satisfy the constraint
+            post_type='standard', # or 'repost' if you have that type
+            league=original_post.league
         )
         
-        return Response({'status': 'reposted', 'id': repost.id}, status=201)
-
+        # 3. Return the NEW count for the frontend to update the UI
+        # We count all posts where this post is the 'parent'
+        new_count = Post.objects.filter(parent_post=original_post).count()
+        
+        return Response({
+            'status': 'reposted', 
+            'id': repost.id,
+            'reposts_count': new_count
+        }, status=201)
 
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
     """

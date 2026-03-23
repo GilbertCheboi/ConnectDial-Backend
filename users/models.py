@@ -78,12 +78,38 @@ class FanPreference(models.Model):
 
 class Profile(models.Model):
 
-    user = models.ForeignKey(
+    user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="users_Profile_user"
+        related_name="profile"
     )
     display_name = models.CharField(max_length=50, blank=True)
     bio = models.TextField(max_length=500, blank=True)
     profile_image = models.ImageField(upload_to='profiles/', null=True, blank=True)
     banner_image = models.ImageField(upload_to='banners/', null=True, blank=True)
+    fcm_token = models.TextField(null=True, blank=True) # 🚀 Add this
+
+
+class Follow(models.Model):
+    # The person doing the following
+    follower = models.ForeignKey(
+        settings.AUTH_USER_MODEL, 
+        related_name='following', 
+        on_delete=models.CASCADE
+    )
+    # The person being followed
+    followed = models.ForeignKey(
+        settings.AUTH_USER_MODEL, 
+        related_name='followers', 
+        on_delete=models.CASCADE
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # Prevent a user from following the same person twice
+        unique_together = ('follower', 'followed')
+        verbose_name = 'Follow'
+        verbose_name_plural = 'Follows'
+
+    def __str__(self):
+        return f"{self.follower.username} follows {self.followed.username}"

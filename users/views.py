@@ -5,11 +5,48 @@ from rest_framework.permissions import IsAuthenticated
 from dj_rest_auth.registration.views import SocialLoginView
 from allauth.socialaccount.providers.google.views import GoogleOAuth2Adapter
 from .serializers import UserSerializer, OnboardingSerializer,ProfileSerializer 
-from .models import User, Profile
-from rest_framework.parsers import MultiPartParser, FormParser
+from .models import User, Profile, FanPreference
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.authentication import TokenAuthentication # <--- Add this import
 
+from .models import Follow # Make sure to import your new model
 
+class ToggleFollowView(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, user_id):
+        """
+        user_id is the ID of the person the logged-in user wants to follow/unfollow.
+        """
+        follower = request.user
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if follower == target_user:
+            return Response({"error": "You cannot follow yourself"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if the relationship already exists
+        follow_rel = Follow.objects.filter(follower=follower, followed=target_user)
+
+        if follow_rel.exists():
+            # UNFOLLOW logic
+            follow_rel.delete()
+            return Response({
+                "following": False,
+                "message": f"Unfollowed {target_user.username}",
+                "follower_count": target_user.followers.count()
+            }, status=status.HTTP_200_OK)
+        else:
+            # FOLLOW logic
+            Follow.objects.create(follower=follower, followed=target_user)
+            return Response({
+                "following": True,
+                "message": f"Following {target_user.username}",
+                "follower_count": target_user.followers.count()
+            }, status=status.HTTP_201_CREATED)
 # Social login
 class GoogleLogin(SocialLoginView):
     adapter_class = GoogleOAuth2Adapter
@@ -26,10 +63,24 @@ class OnboardingView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        serializer = OnboardingSerializer(data=request.data, context={'request': request})
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response({"message": "Onboarding complete!"})
+        user = request.user
+        preferences_data = request.data.get('fan_preferences', [])
+        append_mode = request.data.get('append_mode', False)
+
+        # 🚀 THE FIX: Only delete if NOT appending
+        if not append_mode:
+            # Clear existing follows for a fresh start (Onboarding mode)
+            FanPreference.objects.filter(user=user).delete()
+        
+        # Add/Update the new selections
+        for item in preferences_data:
+            FanPreference.objects.update_or_create(
+                user=user,
+                league_id=item['league'],
+                defaults={'team_id': item['team']}
+            )
+
+        return Response({"status": "success"}, status=201)
 
 
 class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
@@ -41,8 +92,7 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
     permission_classes = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
     # MultiPartParser is critical for handling Image/File uploads from React Native
-    parser_classes = [MultiPartParser, FormParser]
-
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
     def get_object(self):
         # This is the "secret sauce" for viewing other profiles
         user_id = self.request.query_params.get('user_id')
@@ -122,3 +172,25 @@ class GoogleLogin(SocialLoginView):
         return CustomLoginSerializer
 
 # ... Keep your OnboardingView and UserProfileUpdateView as they are ...
+
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+
+class LogoutView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # 1. Find the user's profile
+        profile = request.user.profile
+        
+        # 2. Wipe the token so Celery doesn't try to send pushes anymore
+        profile.fcm_token = None
+        profile.save()
+
+        # 3. (Optional) Delete the actual DRF Token if you use them
+        if hasattr(request.user, 'auth_token'):
+            request.user.auth_token.delete()
+
+        return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)

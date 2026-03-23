@@ -1,21 +1,23 @@
 from rest_framework import serializers
-from notifications.models import Notification
-
+from .models import Notification
+from django.contrib.humanize.templatetags.humanize import naturaltime
+from users.serializers import ProfileSerializer 
 
 class NotificationSerializer(serializers.ModelSerializer):
-    actor_username = serializers.CharField(source='actor.username', read_only=True)
-    actor_fan_badge = serializers.CharField(source='actor.fan_badge', read_only=True)
+    # 🚀 Simple and clean now that we use OneToOneField
+    sender_profile = ProfileSerializer(source='sender.profile', read_only=True)
+    time_ago = serializers.SerializerMethodField()
 
     class Meta:
         model = Notification
         fields = [
-            'id',
-            'notification_type',
-            'actor_username',
-            'actor_fan_badge',
-            'post',
-            'comment',
-            'is_read',
-            'created_at',
+            'id', 
+            'notification_type', 
+            'sender_profile', 
+            'post', 
+            'is_read', 
+            'time_ago'
         ]
 
+    def get_time_ago(self, obj):
+        return naturaltime(obj.created_at)

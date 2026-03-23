@@ -1,76 +1,79 @@
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+from posts.models import PostLike, Comment, Post
+from users.models import Follow
+from .models import Notification
+from .tasks import send_push_notification_task # 🚀 Import your Celery task
 
-from posts.models import PostLike, Comment, PostShare
-from feeds.models import UserFollow
-from notifications.models import Notification
 
 
+# 1. Like SIGNAL
 
 @receiver(post_save, sender=PostLike)
-def like_notification(sender, instance, created, **kwargs):
-    if not created:
-        return
+def create_like_notification(sender, instance, created, **kwargs):
+    if created:
+        # Avoid notifying yourself if you like your own post
+        if instance.user != instance.post.author:
+            Notification.objects.create(
+                recipient=instance.post.author,
+                sender=instance.user,
+                notification_type='like',
+                post=instance.post
+            )
+# 2. Follow SIGNAL
 
-    post = instance.post
-    if instance.user == post.author:
-        return
+@receiver(post_save, sender=Follow)
+def create_follow_notification(sender, instance, created, **kwargs):
+    if created:
+        Notification.objects.create(
+            recipient=instance.followed,
+            sender=instance.follower,
+            notification_type='follow'
+        )
 
-    Notification.objects.create(
-        recipient=post.author,
-        actor=instance.user,
-        notification_type='like',
-        post=post
-    )
-
-
+# 3. COMMENT SIGNAL
 @receiver(post_save, sender=Comment)
-def comment_notification(sender, instance, created, **kwargs):
-    if not created:
-        return
+def create_comment_notification(sender, instance, created, **kwargs):
+    if created and instance.user != instance.post.author:
+        Notification.objects.create(
+            recipient=instance.post.author,
+            sender=instance.user,
+            notification_type='comment',
+            post=instance.post
+        )
 
-    post = instance.post
-    if instance.user == post.author:
-        return
+# 4. REPOST SIGNAL 
+# (Assuming a repost is a Post where parent_post is not null)
+@receiver(post_save, sender=Post)
+def create_repost_notification(sender, instance, created, **kwargs):
+    if created and instance.parent_post and instance.author != instance.parent_post.author:
+        Notification.objects.create(
+            recipient=instance.parent_post.author,
+            sender=instance.author,
+            notification_type='repost',
+            post=instance.parent_post
+        )
 
-    Notification.objects.create(
-        recipient=post.author,
-        actor=instance.user,
-        notification_type='comment',
-        post=post,
-        comment=instance
-    )
+@receiver(post_save, sender=Notification)
+def trigger_push_notification(sender, instance, created, **kwargs):
+    if created:
+        message_map = {
+            'like': f"{instance.sender.username} liked your post",
+            'follow': f"{instance.sender.username} started following you",
+            'comment': f"{instance.sender.username} commented on your post",
+            'repost': f"{instance.sender.username} reposted your content",
+        }
+        
+        display_message = message_map.get(instance.notification_type, "New activity")
 
+        # Determine which ID to send for navigation
+        # For likes/comments, send the Post ID. For follows, send the Sender ID.
+        nav_id = instance.post.id if instance.post else instance.sender.id
 
-@receiver(post_save, sender=UserFollow)
-def follow_notification(sender, instance, created, **kwargs):
-    if not created:
-        return
-
-    if instance.follower == instance.following:
-        return
-
-    Notification.objects.create(
-        recipient=instance.following,
-        actor=instance.follower,
-        notification_type='follow'
-    )
-
-
-@receiver(post_save, sender=PostShare)
-def share_notification(sender, instance, created, **kwargs):
-    if not created:
-        return
-
-    post = instance.original_post
-    if instance.user == post.author:
-        return
-
-    Notification.objects.create(
-        recipient=post.author,
-        actor=instance.user,
-        notification_type='share',
-        post=post
-    )
-
-
+        send_push_notification_task.delay(
+            user_id=instance.recipient.id,
+            title="ConnectDial",
+            message=display_message,
+            notification_type=instance.notification_type,
+            object_id=nav_id
+        )

@@ -40,6 +40,48 @@ class SupportLogicMixin:
         return None
 
 
+# Assuming Post is imported from your models and SupportLogicMixin is available
+class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
+    """
+    Updated to include Team and League info for the Quote Box.
+    """
+    author_details = serializers.SerializerMethodField()
+    supporting_info = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Post
+        fields = [
+            'id', 'content', 'media_file', 'author_details', 
+            'supporting_info', 'league', 'created_at'
+        ]
+
+    def get_author_details(self, obj):
+        # 🚀 1. Updated for OneToOneField 'profile'
+        try:
+            profile = obj.author.profile
+        except AttributeError:
+            profile = None
+
+        request = self.context.get('request')
+        profile_pic = None
+        
+        # 2. Handle Profile Picture URI
+        if profile and profile.profile_image:
+            if request:
+                profile_pic = request.build_absolute_uri(profile.profile_image.url)
+            else:
+                profile_pic = profile.profile_image.url
+            
+        return {
+            "id": obj.author.id,
+            "username": obj.author.username,
+            "display_name": profile.display_name if profile and profile.display_name else obj.author.username,
+            "profile_pic": profile_pic,
+        }
+    # The SupportLogicMixin handles get_supporting_info automatically 
+    # as long as it's included in the class definition.
+
+from users.models import Follow  # Import your Follow model
 
 class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
     author_details = serializers.SerializerMethodField() 
@@ -48,13 +90,14 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
     likes_count = serializers.IntegerField(read_only=True, default=0)
     comments_count = serializers.IntegerField(read_only=True, default=0)
     liked_by_me = serializers.SerializerMethodField()
+    reposts_count = serializers.IntegerField(read_only=True, default=0)
     original_post = serializers.SerializerMethodField()
 
     class Meta:
         model = Post
         fields = [
             'id', 'author_details', 'content', 'is_short', 'post_type', 'media_file',
-            'league', 'supporting_info', 'likes_count', 'comments_count', 
+            'league', 'supporting_info', 'likes_count', 'comments_count', 'reposts_count',
             'liked_by_me', 'created_at', 'is_owner', 'original_post'
         ]
 
@@ -70,44 +113,52 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             return obj.likes.filter(user=request.user).exists()
         return False
 
-    def get_author_details(self, obj):
-        return {
-            "id": obj.author.id,
-            "username": obj.author.username,
-            "profile_pic": obj.author.profile.image.url if hasattr(obj.author, 'profile') else None
-        }
-
     def get_original_post(self, obj):
         if obj.parent_post:
-            # We use a separate "Mini" serializer or this same one to avoid infinite loops
-            # passing 'context' is vital so 'liked_by_me' works in the nested post too
-            return PostSerializer(obj.parent_post, context=self.context).data
+            return ParentPostSerializer(obj.parent_post, context=self.context).data
         return None
 
     def get_author_details(self, obj):
-        # Reach into the 'users' app via the related_name: "users_Profile_user"
-        profile = obj.author.users_Profile_user.first()
-        
+        """
+        Includes Follow status so the PostCard can render the 'Follow' button.
+        """
+        # 🚀 1. Access the profile directly via the new 'profile' related_name
+        try:
+            profile = obj.author.profile
+        except AttributeError:
+            profile = None
+            
         request = self.context.get('request')
         profile_pic = None
+        is_following = False
         
-        # Build the full URL so React Native can see it
+        # 2. Handle Profile Picture URI
         if profile and profile.profile_image:
             if request:
+                # Ensures React Native receives the full http:// URL
                 profile_pic = request.build_absolute_uri(profile.profile_image.url)
             else:
                 profile_pic = profile.profile_image.url
 
+        # 3. Check Follow Status for the logged-in user
+        if request and request.user.is_authenticated:
+            # 🚀 IMPORT FOLLOW HERE to avoid Circular Import and Path errors
+            from users.models import Follow 
+            
+            if request.user != obj.author:
+                is_following = Follow.objects.filter(
+                    follower=request.user, 
+                    followed=obj.author
+                ).exists()
+
         return {
             "id": obj.author.id,
             "username": obj.author.username,
-            # Priority: Profile display_name -> User username -> 'Fan'
             "display_name": profile.display_name if profile and profile.display_name else obj.author.username,
             "profile_pic": profile_pic,
+            "is_following": is_following,
+            "followers_count": obj.author.followers.count(),
         }
-
-
-
 
 
 

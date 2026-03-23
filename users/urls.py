@@ -1,17 +1,22 @@
 from django.urls import path, include
-from .views import GoogleLogin, OnboardingView, UserProfileUpdateView, CustomLoginView
+from .views import (
+    GoogleLogin, OnboardingView, UserProfileUpdateView, 
+    CustomLoginView, ToggleFollowView, LogoutView # 🚀 Add LogoutView here
+)
 
 urlpatterns = [
-    # 1. MANUALLY OVERRIDE the login route before including the rest
     path('login/', CustomLoginView.as_view(), name='rest_login'),    
-    # 2. Keep the rest of the defaults
     path('', include('dj_rest_auth.urls')),
     path('register/', include('dj_rest_auth.registration.urls')),
     
-    # 3. Google Login now uses the logic that includes User data
     path('social/google/', GoogleLogin.as_view(), name='google_login'),
+    path('users/<int:user_id>/toggle-follow/', ToggleFollowView.as_view(), name='toggle-follow'),
 
-    # Onboarding routes
+    # Onboarding and Profile
     path('onboarding/', OnboardingView.as_view(), name='onboarding'),
+    # 🚀 This 'update/' route is your "View Level" entrance for the FCM token
     path('update/', UserProfileUpdateView.as_view(), name='profile-update'),
+    
+    # 🚀 Add this for a clean logout
+    path('logout-custom/', LogoutView.as_view(), name='logout-custom'),
 ]

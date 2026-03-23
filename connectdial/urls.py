@@ -25,7 +25,6 @@ urlpatterns = [
     path('api/health/', health_check),
     path('api/posts/', include('posts.urls')),  # <--- Posts API
     path('auth/', include('users.urls')),  # login + registration
-    path('api/follow/', include('feeds.urls')),
     path('api/notifications/', include('notifications.urls')),
     path('api/search/', include('search.urls')),
     path('api/trending/', include('trending.urls')),

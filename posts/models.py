@@ -40,7 +40,7 @@ class Post(models.Model):
         on_delete=models.SET_NULL, 
         null=True, 
         blank=True, 
-        related_name='reposts'
+        related_name='quoted_by'
     )
     is_repost = models.BooleanField(default=False)
 
