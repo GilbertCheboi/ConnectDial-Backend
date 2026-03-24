@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from posts.models import Post, Comment
+from posts.models import Post, Comment, Hashtag
 from users.models import FanPreference
 User = get_user_model()
 from users.models import Profile  # Import from the users app
@@ -213,6 +213,17 @@ class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
         if hasattr(obj, 'likes'):
             return obj.likes.count()
         return 0
+
+
+class HashtagSerializer(serializers.ModelSerializer):
+    post_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Hashtag
+        fields = ['id', 'name', 'post_count']
+
+
+
 
     # Note: get_supporting_info is NOT defined here because 
     # it is being inherited automatically from SupportLogicMixin.

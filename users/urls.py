@@ -1,7 +1,7 @@
 from django.urls import path, include
 from .views import (
-    GoogleLogin, OnboardingView, UserProfileUpdateView, 
-    CustomLoginView, ToggleFollowView, LogoutView # 🚀 Add LogoutView here
+    GoogleLogin, OnboardingView, UserProfileUpdateView, ProfileListView,
+    CustomLoginView, ToggleFollowView, LogoutView 
 )
 
 urlpatterns = [
@@ -16,6 +16,7 @@ urlpatterns = [
     path('onboarding/', OnboardingView.as_view(), name='onboarding'),
     # 🚀 This 'update/' route is your "View Level" entrance for the FCM token
     path('update/', UserProfileUpdateView.as_view(), name='profile-update'),
+    path('search/', ProfileListView.as_view(), name='profile-search'), # 🚀 Add this
     
     # 🚀 Add this for a clean logout
     path('logout-custom/', LogoutView.as_view(), name='logout-custom'),

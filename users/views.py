@@ -1,5 +1,5 @@
 from rest_framework.views import APIView
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, filters
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from dj_rest_auth.registration.views import SocialLoginView
@@ -83,6 +83,29 @@ class OnboardingView(APIView):
         return Response({"status": "success"}, status=201)
 
 
+class ProfileListView(generics.ListAPIView):
+    """
+    Handles the search functionality.
+    Returns a list of profiles based on a ?search= query.
+    """
+    # Use select_related to join the User table for faster 'user__username' searching
+    queryset = Profile.objects.select_related('user').all()
+    serializer_class = ProfileSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    
+    # 🚀 Step 1: Keep the Search Filter
+    filter_backends = [filters.SearchFilter]
+    
+    # 🚀 Step 2: Ensure these fields match your model exactly
+    # We use 'user__username' because 'username' is on the AUTH_USER_MODEL, not Profile.
+    search_fields = ['user__username', 'bio', 'display_name']
+
+    def get_queryset(self):
+        # 🚀 THE CHANGE: Return all profiles without excluding yourself.
+        # This way, if you search your own name, you actually show up.
+        return self.queryset
+
 class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
     """
     View to handle retrieving and updating the User Profile.
@@ -113,6 +136,29 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
         """
         return self.update(request, *args, **kwargs)
 
+    
+    def get_object(self):
+        # 🚀 Look for 'user_id' in the URL params: /api/profile/?user_id=5
+        user_id = self.request.query_params.get('user_id')
+        print(f"DEBUG: Requesting Profile for user_id: {user_id}") # 👈 Check your terminal
+        
+        if user_id:
+            try:
+                return Profile.objects.get(user_id=user_id)
+            except Profile.DoesNotExist:
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                user = User.objects.get(id=user_id)
+                return Profile.objects.create(user=user)
+
+        return Profile.objects.get(user=self.request.user)
+            # Fetch the profile belonging to that specific User ID
+  
+        # If no user_id is provided, default to the logged-in user
+        profile, created = Profile.objects.get_or_create(user=self.request.user)
+        return profile
+
+        
     def update(self, request, *args, **kwargs):
         """
         Handles the actual update logic. 

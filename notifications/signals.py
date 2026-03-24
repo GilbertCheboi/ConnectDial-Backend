@@ -4,6 +4,7 @@ from posts.models import PostLike, Comment, Post
 from users.models import Follow
 from .models import Notification
 from .tasks import send_push_notification_task # 🚀 Import your Celery task
+from posts.services import handle_mentions # 🚀 Import the helper
 
 
 
@@ -53,6 +54,23 @@ def create_repost_notification(sender, instance, created, **kwargs):
             notification_type='repost',
             post=instance.parent_post
         )
+
+
+
+@receiver(post_save, sender=Post)
+def create_post_related_notifications(sender, instance, created, **kwargs):
+    if created:
+        # 1. Handle Reposts (your existing logic)
+        if instance.parent_post and instance.author != instance.parent_post.author:
+            Notification.objects.create(
+                recipient=instance.parent_post.author,
+                sender=instance.author,
+                notification_type='repost',
+                post=instance.parent_post
+            )
+        
+        # 2. Handle Mentions 🚀
+        handle_mentions(instance)
 
 @receiver(post_save, sender=Notification)
 def trigger_push_notification(sender, instance, created, **kwargs):

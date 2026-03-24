@@ -7,6 +7,8 @@ class Notification(models.Model):
         ('comment', 'Comment'),
         ('repost', 'Repost'),
         ('follow', 'Follow'),
+        ('mention', 'Mention'), # 🚀 New type for mentions
+
     )
 
     recipient = models.ForeignKey(

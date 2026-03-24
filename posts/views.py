@@ -1,4 +1,7 @@
-from rest_framework import generics,viewsets, permissions, status
+from rest_framework import generics,viewsets, permissions, status, filters
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from .models import Post, Comment, PostLike
 from .serializers import PostSerializer, CommentSerializer
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -13,6 +16,12 @@ from django.db.models import Q, Count, OuterRef, Exists
 from rest_framework import generics, permissions
 from .models import Post, PostLike
 from .serializers import PostSerializer
+
+
+from .models import Hashtag
+from .serializers import HashtagSerializer
+from .services import get_trending_hashtags
+
 
 # posts/permissions.py (or wherever your permission is defined)
 
@@ -51,9 +60,21 @@ class CommentViewSet(viewsets.ModelViewSet):
 
 
 
+
+
 class PostViewSet(viewsets.ModelViewSet):
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
+
+    # 🚀 Step 1: Add the Search Backend
+    # This tells DRF to look for the ?search= query parameter in the URL
+    filter_backends = [filters.SearchFilter]
+    
+    # 🚀 Step 2: Define what fields can be searched
+    # Use 'author__username' to search the name of the person who posted
+    # Use 'content' for the post text
+    # Use 'league__name' to search for posts by league name
+    search_fields = ['content', 'author__username', 'league__name']
 
     def get_queryset(self):
         user = self.request.user
@@ -84,41 +105,40 @@ class PostViewSet(viewsets.ModelViewSet):
         league_id = self.request.query_params.get('league')
         leagues_list = self.request.query_params.get('leagues') 
         team_id = self.request.query_params.get('team')
-        feed_type = self.request.query_params.get('feed_type') # 🚀 NEW: global vs following
+        feed_type = self.request.query_params.get('feed_type')
 
-        # --- 4. FILTERING LOGIC ---
-
-        # A. Personalized Following Feed (The "Home" Feed)
-        if feed_type == 'following' and user.is_authenticated:
-            # Get the list of user IDs that the current user follows
-            following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
-            # Include user's own posts in their following feed
-            queryset = queryset.filter(author_id__in=list(following_ids) + [user.id])
-
-        # B. Profile View Logic
-        elif user_id:
-            queryset = queryset.filter(author_id=user_id)
-        elif filter_type == 'mine' and user.is_authenticated:
-            queryset = queryset.filter(author=user)
-
-        # C. Specific League/Team (Drawer Navigation)
-        elif league_id:
+        # --- 4. ADDITIVE FILTERING LOGIC ---
+        
+        # A. MANDATORY LEAGUE FILTER (The Guard)
+        # This still applies during search, so searching "Goal" only shows 
+        # posts from your leagues!
+        if league_id:
             queryset = queryset.filter(league_id=league_id)
-        elif team_id:
-            queryset = queryset.filter(team_id=team_id)
-
-        # D. The Hard Filter (Onboarding preferences)
         elif leagues_list:
             try:
                 ids = [int(x) for x in leagues_list.split(',') if x.strip().isdigit()]
-                queryset = queryset.filter(league_id__in=ids)
+                if ids:
+                    queryset = queryset.filter(league_id__in=ids)
             except ValueError:
                 pass
+
+        # B. SOCIAL FILTER (The "Who")
+        if feed_type == 'following' and user.is_authenticated:
+            following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
+            queryset = queryset.filter(Q(author_id__in=following_ids) | Q(author=user))
         
-        # If feed_type is 'global' or no filters match, it returns the full optimized queryset
-        return queryset.order_by('-created_at')
+        # C. PROFILE / CONTEXT FILTERS
+        if user_id:
+            queryset = queryset.filter(author_id=user_id)
+        elif filter_type == 'mine' and user.is_authenticated:
+            queryset = queryset.filter(author=user)
         
+        if team_id:
+            queryset = queryset.filter(team_id=team_id)
+
+        # 5. Final Sorting
         return queryset.order_by('-created_at')
+
     def perform_create(self, serializer):
         # 1. Get the parent_post ID from the request (sent by Quote logic)
         parent_id = self.request.data.get('parent_post')
@@ -332,3 +352,18 @@ class SharePostView(APIView):
 
         return Response({"shared": True})
 
+
+
+
+
+
+class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Hashtag.objects.all()
+    serializer_class = HashtagSerializer
+
+    @action(detail=False, methods=['get'])
+    def trending(self, request):
+        # Get top 10 tags from the last 24 hours
+        trending_tags = get_trending_hashtags(limit=10, days=1)
+        serializer = self.get_serializer(trending_tags, many=True)
+        return Response(serializer.data)

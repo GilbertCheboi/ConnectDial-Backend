@@ -35,6 +35,19 @@ class Post(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     is_short = models.BooleanField(default=False)
+    mentions = models.ManyToManyField(
+        
+        settings.AUTH_USER_MODEL, 
+        related_name='mentioned_in', 
+        blank=True
+    )
+
+    hashtags = models.ManyToManyField(
+        'Hashtag', # We'll define this model next
+        blank=True,
+        related_name='posts'
+    )
+
     parent_post = models.ForeignKey(
         'self', 
         on_delete=models.SET_NULL, 
@@ -54,6 +67,13 @@ class Post(models.Model):
 
 
 User = settings.AUTH_USER_MODEL
+
+class Hashtag(models.Model):
+    name = models.CharField(max_length=100, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"#{self.name}"
 
 
 class PostLike(models.Model):

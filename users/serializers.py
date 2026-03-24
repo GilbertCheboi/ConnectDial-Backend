@@ -116,11 +116,12 @@ class ProfileSerializer(serializers.ModelSerializer):
     is_following = serializers.SerializerMethodField()
     followers_count = serializers.SerializerMethodField()
     following_count = serializers.SerializerMethodField()
+    user_id = serializers.ReadOnlyField(source='user.id')
     
     class Meta:
         model = Profile
         # 🚀 Add 'username' and 'fan_preferences' to the fields
-        fields = ['display_name', 'bio', 'profile_image', 'banner_image', 'fcm_token', 'username', 'fan_preferences', 'is_following', 'followers_count', 'following_count']
+        fields = ['id', 'user_id', 'display_name', 'bio', 'profile_image', 'banner_image', 'fcm_token', 'username', 'fan_preferences', 'is_following', 'followers_count', 'following_count']
 
     def update(self, instance, validated_data):
         return super().update(instance, validated_data)
