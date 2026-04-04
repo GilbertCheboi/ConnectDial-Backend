@@ -245,9 +245,17 @@ class PostViewSet(viewsets.ModelViewSet):
             'reposts_count': new_count
         }, status=201)
 
+from django.db.models import Count, Exists, OuterRef
+from rest_framework import viewsets, permissions
+from posts.models import Post, PostLike
+from posts.serializers import PostSerializer
+
+
+
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    Dedicated ViewSet for the full-screen Shorts feed.
+    Personalized Shorts feed filtered by the user's followed leagues.
+    Supports both physical .mp4 files and YouTube link content.
     """
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -255,28 +263,48 @@ class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         user = self.request.user
         
-        # 1. Filter only for Shorts that actually have a video file
-        queryset = Post.objects.all()
+        # 1. FIX: Filter for items marked as shorts that have EITHER:
+        # a) A physical video file (.mp4)
+        # b) A YouTube link in the content (from your tasks)
+        queryset = Post.objects.filter(
+            is_short=True
+        ).filter(
+            Q(media_file__icontains='.mp4') | 
+            Q(content__icontains='youtube.com') | 
+            Q(content__icontains='youtu.be')
+        )
 
-        # 2. Optimized fetching of author and league
-        queryset = queryset.select_related('author', 'league')
+        # 2. Filter by the leagues the user follows
+        # Accessing the 'fan_preferences' relationship on the User model
+        followed_league_ids = user.fan_preferences.values_list('league_id', flat=True)
+        
+        if followed_league_ids.exists():
+            queryset = queryset.filter(league_id__in=followed_league_ids)
+        else:
+            # Fallback: If they follow NOTHING, show all shorts so the screen isn't empty.
+            # We don't filter further here, allowing 'queryset' to remain as is.
+            pass 
 
-        # 3. Annotate counts for the UI overlays
+        # 3. Optimized fetching (Performance boost for your local server)
+        queryset = queryset.select_related(
+            'author', 
+            'league', 
+            'team', 
+            'author__profile'
+        ).prefetch_related('hashtags')
+
+        # 4. Annotate counts for the React Native UI overlays
         queryset = queryset.annotate(
             likes_count=Count('likes', distinct=True),
             comments_count=Count('comments', distinct=True)
         )
 
-        # 4. Check if the current user liked this specific short
-        if user.is_authenticated:
-            user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-            queryset = queryset.annotate(user_has_liked=Exists(user_likes))
+        # 5. Check if the current user liked this specific short
+        user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
+        queryset = queryset.annotate(user_has_liked=Exists(user_likes))
 
+        # 6. Return newest first
         return queryset.order_by('-created_at')
-
- 
-
-
 class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Post.objects.all()
     serializer_class = PostSerializer

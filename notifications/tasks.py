@@ -1,12 +1,11 @@
-from celery import shared_task
-from django.contrib.auth import get_user_model
-from firebase_admin import messaging
-import firebase_admin
-from firebase_admin import credentials
 import os
+import firebase_admin
+from firebase_admin import credentials, messaging
+from celery import shared_task
 from django.conf import settings
+from django.contrib.auth import get_user_model
 
-# Ensure Firebase is only initialized once at the module level
+# Ensure Firebase is only initialized once
 if not firebase_admin._apps:
     cred_path = os.path.join(settings.BASE_DIR, 'firebase-service-account.json')
     cred = credentials.Certificate(cred_path)
@@ -14,18 +13,23 @@ if not firebase_admin._apps:
 
 User = get_user_model()
 
-@shared_task
+@shared_task(name="send_push_notification_task")
 def send_push_notification_task(user_id, title, message, notification_type=None, object_id=None):
     """
-    Sends a push notification with a data payload for app navigation.
+    Sends a push notification via FCM, skipping bots and checking for valid tokens.
     """
-    # 🚀 RESTORED: Local import to prevent circular dependency
+    # Local import to prevent circular dependency issues with Profile
     from users.models import Profile 
     
     try:
-        user = User.objects.get(id=user_id)
+        user = User.objects.select_related('profile').get(id=user_id)
         
-        # Access fcm_token via the profile relationship
+        # 🚀 1. BOT CHECK: Do not attempt to send notifications to bots
+        # This prevents the "No FCM token found" log spam you were seeing.
+        if hasattr(user, 'profile') and user.profile.is_bot:
+            return f"⏭️ Skipped: {user.username} is a bot (no notification needed)."
+
+        # 2. Token Retrieval
         try:
             profile = user.profile
             registration_token = profile.fcm_token
@@ -33,17 +37,16 @@ def send_push_notification_task(user_id, title, message, notification_type=None,
             return f"❌ User {user.username} has no profile attached."
 
         if not registration_token:
-            return f"⚠️ No FCM token found in profile for {user.username}"
+            return f"⚠️ No FCM token found for human user {user.username}. Notification dropped."
 
-        # 🚀 1. Construct the Data Payload
-        # These keys ('type' and 'id') must match what your React Native 
-        # listeners are looking for.
+        # 🚀 3. Construct Data Payload for React Native Navigation
+        # Ensure all values are strings for Firebase compatibility
         data_payload = {
             "type": str(notification_type) if notification_type else "general",
             "id": str(object_id) if object_id else "",
         }
 
-        # 🚀 2. Build the Message
+        # 🚀 4. Build the Firebase Message
         message_obj = messaging.Message(
             notification=messaging.Notification(
                 title=title,
@@ -59,16 +62,19 @@ def send_push_notification_task(user_id, title, message, notification_type=None,
                     sound='default',
                 ),
             ),
+            # Optional: Add APNS for iOS
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(sound='default')
+                )
+            )
         )
 
-        # 3. Send to Firebase
+        # 5. Send to Firebase
         response = messaging.send(message_obj)
-        print(f"✅ Successfully sent {notification_type} message to {user.username}: {response}")
-        return response
+        return f"✅ Sent {notification_type} to {user.username}: {response}"
 
     except User.DoesNotExist:
-        print(f"❌ User ID {user_id} not found")
-        return None
+        return f"❌ User ID {user_id} not found."
     except Exception as e:
-        print(f"❌ Firebase Error: {str(e)}")
-        return None
+        return f"❌ Firebase Error: {str(e)}"

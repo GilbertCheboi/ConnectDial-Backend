@@ -117,7 +117,7 @@ class ProfileSerializer(serializers.ModelSerializer):
     followers_count = serializers.SerializerMethodField()
     following_count = serializers.SerializerMethodField()
     user_id = serializers.ReadOnlyField(source='user.id')
-    
+    profile_image = serializers.SerializerMethodField()    
     class Meta:
         model = Profile
         # 🚀 Add 'username' and 'fan_preferences' to the fields
@@ -132,6 +132,12 @@ class ProfileSerializer(serializers.ModelSerializer):
             # Check if the logged-in user follows the owner of THIS profile
             return Follow.objects.filter(follower=request.user, followed=obj.user).exists()
         return False
+    
+    def get_profile_image(self, obj):
+        if obj.profile_image:
+            # 🚀 This forces the serializer to return the https://storage... link
+            return obj.profile_image.url
+        return None
 
     def get_followers_count(self, obj):
         return obj.user.followers.count()

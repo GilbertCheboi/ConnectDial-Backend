@@ -2,6 +2,8 @@ from django.db import models
 from django.conf import settings
 from leagues.models import League, Team
 
+from django.core.files.storage import default_storage
+
 class Post(models.Model):
     """
     Represents a user post (text, image, or video)

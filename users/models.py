@@ -2,6 +2,8 @@ from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 
+from django.core.files.storage import default_storage
+
 
 class User(AbstractUser):
 
@@ -88,6 +90,7 @@ class Profile(models.Model):
     profile_image = models.ImageField(upload_to='profiles/', null=True, blank=True)
     banner_image = models.ImageField(upload_to='banners/', null=True, blank=True)
     fcm_token = models.TextField(null=True, blank=True) # 🚀 Add this
+    is_bot = models.BooleanField(default=False)
 
 
 class Follow(models.Model):

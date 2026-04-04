@@ -29,7 +29,7 @@ urlpatterns = [
     path('api/search/', include('search.urls')),
     path('api/trending/', include('trending.urls')),
     path('api/videos/', include('short_videos.urls')),
-    
+    path('api/', include('leagues.urls')),    
 
 
 

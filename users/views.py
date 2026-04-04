@@ -152,9 +152,11 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
                 return Profile.objects.create(user=user)
 
         return Profile.objects.get(user=self.request.user)
+
+        
+
             # Fetch the profile belonging to that specific User ID
-  
-        # If no user_id is provided, default to the logged-in user
+    def get_object(self):
         profile, created = Profile.objects.get_or_create(user=self.request.user)
         return profile
 

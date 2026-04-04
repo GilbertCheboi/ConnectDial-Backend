@@ -1,18 +1,15 @@
+# connectdial/celery.py
+
 import os
 from celery import Celery
 
-# Set the default Django settings module
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'connectdial.settings')
 
 app = Celery('connectdial')
-
-# Using a string here means the worker doesn't have to serialize
-# the configuration object to child processes.
 app.config_from_object('django.conf:settings', namespace='CELERY')
 
-# Load task modules from all registered Django apps.
+# This is the standard way to find tasks.py in every app
 app.autodiscover_tasks()
 
-@app.task(bind=True)
-def debug_task(self):
-    print(f'Request: {self.request!r}')
+# 🚀 ADD THIS TO FORCE DISCOVERY IF AUTODISCOVER FAILS
+# app.autodiscover_tasks(['notifications', 'posts'])

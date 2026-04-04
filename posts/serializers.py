@@ -93,11 +93,15 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
     reposts_count = serializers.IntegerField(read_only=True, default=0)
     original_post = serializers.SerializerMethodField()
 
+    # 🚀 NEW: Details for the Shorts Feed UI
+    league_details = serializers.SerializerMethodField()
+    team_details = serializers.SerializerMethodField()
+
     class Meta:
         model = Post
         fields = [
             'id', 'author_details', 'content', 'is_short', 'post_type', 'media_file',
-            'league', 'supporting_info', 'likes_count', 'comments_count', 'reposts_count',
+            'league', 'league_details', 'team', 'team_details', 'supporting_info', 'likes_count', 'comments_count', 'reposts_count',
             'liked_by_me', 'created_at', 'is_owner', 'original_post'
         ]
 
@@ -112,6 +116,26 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         if request and request.user.is_authenticated:
             return obj.likes.filter(user=request.user).exists()
         return False
+
+    def get_league_details(self, obj):
+        """ Returns name and ID for the 'NBA/F1' badge in React Native """
+        if obj.league:
+            return {
+                "id": obj.league.id,
+                "name": obj.league.name,
+                "logo": obj.league.logo.url if obj.league.logo else None
+            }
+        return None
+
+    def get_team_details(self, obj):
+        """ Returns the specific team name for the tag next to the username """
+        if obj.team:
+            return {
+                "id": obj.team.id,
+                "name": obj.team.name,
+                "logo": obj.team.logo.url if obj.team.logo else None
+            }
+        return None
 
     def get_original_post(self, obj):
         if obj.parent_post:
@@ -163,17 +187,8 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
 
 
 class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
-    """
-    Full Comment Serializer with nested author details, 
-    support logic for teams/leagues, and like/owner status.
-    """
-    # author_details uses UserMiniSerializer (ensure it's defined above this)
-    author_details = UserMiniSerializer(source='user', read_only=True)
-    
-    # PrimaryKeyRelatedField for the parent post
-    post = serializers.PrimaryKeyRelatedField(read_only=True)
-    
-    # SerializerMethodFields (Handled by the methods below or the Mixin)
+    # 🚀 Changed: We are now defining author_details manually for total control
+    author_details = serializers.SerializerMethodField()
     supporting_info = serializers.SerializerMethodField()
     is_owner = serializers.SerializerMethodField()
     liked_by_me = serializers.SerializerMethodField()
@@ -182,37 +197,52 @@ class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
     class Meta:
         model = Comment
         fields = [
-            'id', 
-            'post', 
-            'author_details', 
-            'content', 
-            'supporting_info', 
-            'created_at', 
-            'is_owner', 
-            'likes_count', 
-            'liked_by_me'
+            'id', 'post', 'author_details', 'content', 
+            'supporting_info', 'created_at', 'is_owner', 
+            'likes_count', 'liked_by_me'
         ]
 
-    def get_is_owner(self, obj):
-        """Checks if the logged-in user wrote this comment."""
+    def get_author_details(self, obj):
+        """
+        Mirroring the PostSerializer logic to ensure profile image 
+        and display name work every time.
+        """
+        user = obj.user
+        try:
+            profile = user.profile
+        except AttributeError:
+            profile = None
+            
         request = self.context.get('request')
-        if request and request.user.is_authenticated:
-            return obj.user == request.user
-        return False
+        profile_pic = None
+        
+        # 1. Handle Profile Picture URI (Full URL for React Native)
+        if profile and profile.profile_image:
+            if request:
+                profile_pic = request.build_absolute_uri(profile.profile_image.url)
+            else:
+                profile_pic = profile.profile_image.url
+
+        # 2. Construct the exact same object structure as PostSerializer
+        return {
+            "id": user.id,
+            "username": user.username,
+            "display_name": profile.display_name if profile and profile.display_name else user.username,
+            "profile_pic": profile_pic,
+        }
+
+    def get_is_owner(self, obj):
+        request = self.context.get('request')
+        return request.user == obj.user if request and request.user.is_authenticated else False
 
     def get_liked_by_me(self, obj):
-        """Checks if the logged-in user has liked this specific comment."""
         request = self.context.get("request")
-        # Ensure your Comment model has a 'likes' related_name or check for the attribute
         if request and request.user.is_authenticated and hasattr(obj, 'likes'):
             return obj.likes.filter(user=request.user).exists()
         return False
 
     def get_likes_count(self, obj):
-        """Returns the total number of likes for the comment."""
-        if hasattr(obj, 'likes'):
-            return obj.likes.count()
-        return 0
+        return obj.likes.count() if hasattr(obj, 'likes') else 0
 
 
 class HashtagSerializer(serializers.ModelSerializer):
