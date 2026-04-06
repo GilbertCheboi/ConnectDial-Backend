@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from .models import PostLike, Post, Comment
 
 from rest_framework.decorators import action
-from users.models import Follow
+from users.models import Follow, FanPreference
 
 
 from django.db.models import Q, Count, OuterRef, Exists
@@ -109,7 +109,14 @@ class PostViewSet(viewsets.ModelViewSet):
 
         # --- 4. ADDITIVE FILTERING LOGIC ---
         
-        # A. MANDATORY LEAGUE FILTER (The Guard)
+        # A. DEFAULT LEAGUE FILTER FOR HOME/FEED (Filter by user's favorite leagues)
+        # For authenticated users, only show posts from leagues they follow
+        if user.is_authenticated:
+            user_league_ids = user.fan_preferences.values_list('league_id', flat=True)
+            if user_league_ids:
+                queryset = queryset.filter(league_id__in=user_league_ids)
+        
+        # B. MANDATORY LEAGUE FILTER (The Guard) - overrides default if specified
         # This still applies during search, so searching "Goal" only shows 
         # posts from your leagues!
         if league_id:

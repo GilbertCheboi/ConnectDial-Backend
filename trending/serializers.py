@@ -3,6 +3,8 @@ from posts.models import Post
 
 class TrendingPostSerializer(serializers.ModelSerializer):
     author_username = serializers.CharField(source='author.username', read_only=True)
+    author_account_type = serializers.CharField(source='author.account_type', read_only=True)
+    author_badge_type = serializers.CharField(source='author.badge_type', read_only=True)
     author_fan_badge = serializers.CharField(source='author.fan_badge', read_only=True)
     league_name = serializers.CharField(source='league.name', read_only=True)
     team_name = serializers.CharField(source='team.name', read_only=True)

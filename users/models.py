@@ -14,10 +14,36 @@ class User(AbstractUser):
         ('facebook', 'Facebook'),
     )
 
+    ACCOUNT_TYPES = (
+        ('fan', 'Fan'),
+        ('news', 'News/Media'),
+        ('organization', 'Club/Organization'),
+    )
+
+    BADGE_TYPES = (
+        ('none', 'None'),
+        ('pioneer', 'Pioneer Member'),
+        ('superfan', 'Verified Superfan'),
+        ('official', 'Official Media'),
+        ('verified', 'Verified Personality'),
+    )
+
     auth_provider = models.CharField(
         max_length=20,
         choices=AUTH_PROVIDERS,
         default='email'
+    )
+
+    account_type = models.CharField(
+        max_length=15,
+        choices=ACCOUNT_TYPES,
+        default='fan'
+    )
+
+    badge_type = models.CharField(
+        max_length=15,
+        choices=BADGE_TYPES,
+        default='none'
     )
 
     favorite_team = models.ForeignKey(
@@ -41,8 +67,12 @@ class User(AbstractUser):
         default='Awaiting Partnership'
     )
 
+    @property
+    def is_pioneer(self):
+        return self.badge_type == 'pioneer'
+
     def __str__(self):
-        return self.username
+        return f"{self.username} ({self.account_type})"
 
 
 
@@ -63,7 +93,9 @@ class FanPreference(models.Model):
     team = models.ForeignKey(
         'leagues.Team',
         on_delete=models.CASCADE,
-        related_name="team_fans"
+        related_name="team_fans",
+        null=True,
+        blank=True
     )
 
     followed_at = models.DateTimeField(auto_now_add=True)

@@ -8,7 +8,7 @@ class UserMiniSerializer(serializers.ModelSerializer):
     """Basic author info for the header"""
     class Meta:
         model = User
-        fields = ['id', 'username', 'fan_badge']
+        fields = ['id', 'username', 'account_type', 'badge_type', 'fan_badge']
 
 class SupportLogicMixin:
     """
@@ -77,13 +77,20 @@ class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             "username": obj.author.username,
             "display_name": profile.display_name if profile and profile.display_name else obj.author.username,
             "profile_pic": profile_pic,
+            "account_type": obj.author.account_type,
+            "badge_type": obj.author.badge_type,
+            "fan_badge": obj.author.fan_badge,
         }
     # The SupportLogicMixin handles get_supporting_info automatically 
     # as long as it's included in the class definition.
 
 from users.models import Follow  # Import your Follow model
 
-class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
+from rest_framework import serializers
+from django.conf import settings
+from users.models import Follow, Profile
+
+class PostSerializer(serializers.ModelSerializer):
     author_details = serializers.SerializerMethodField() 
     supporting_info = serializers.SerializerMethodField()          
     is_owner = serializers.SerializerMethodField()
@@ -93,7 +100,7 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
     reposts_count = serializers.IntegerField(read_only=True, default=0)
     original_post = serializers.SerializerMethodField()
 
-    # 🚀 NEW: Details for the Shorts Feed UI
+    # Details for the Shorts Feed UI / Media Overlays
     league_details = serializers.SerializerMethodField()
     team_details = serializers.SerializerMethodField()
 
@@ -101,8 +108,9 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         model = Post
         fields = [
             'id', 'author_details', 'content', 'is_short', 'post_type', 'media_file',
-            'league', 'league_details', 'team', 'team_details', 'supporting_info', 'likes_count', 'comments_count', 'reposts_count',
-            'liked_by_me', 'created_at', 'is_owner', 'original_post'
+            'league', 'league_details', 'team', 'team_details', 'supporting_info', 
+            'likes_count', 'comments_count', 'reposts_count', 'liked_by_me', 
+            'created_at', 'is_owner', 'original_post'
         ]
 
     def get_is_owner(self, obj):
@@ -118,7 +126,7 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         return False
 
     def get_league_details(self, obj):
-        """ Returns name and ID for the 'NBA/F1' badge in React Native """
+        """ Returns name and ID for the league badge (e.g., PL, NBA) """
         if obj.league:
             return {
                 "id": obj.league.id,
@@ -128,7 +136,7 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         return None
 
     def get_team_details(self, obj):
-        """ Returns the specific team name for the tag next to the username """
+        """ Returns specific team info if the post is tagged to a team """
         if obj.team:
             return {
                 "id": obj.team.id,
@@ -137,16 +145,59 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             }
         return None
 
+    def get_supporting_info(self, obj):
+        """
+        Logic for 'Supports [Team]' badge. 
+        1. Professional accounts (News/Org) -> Always None.
+        2. Fan Post with specific League -> Show League Team.
+        3. Fan Post without League -> Show Global Favorite.
+        """
+        user = obj.author
+        
+        # 🚀 CRITICAL FIX: Block Professional accounts immediately.
+        # This prevents them from ever hitting the "Global" fallback.
+        if user.account_type in ['news', 'organization']:
+            return None
+
+        # ---------------------------------------------------------
+        # Everything below only runs for 'fan' account types
+        # ---------------------------------------------------------
+
+        # 1. SPECIFIC LEAGUE CHECK 
+        # (e.g., If the post is NBA, show their NBA team)
+        if obj.league:
+            # We use .filter().first() to avoid DoesNotExist errors
+            pref = user.fan_preferences.filter(league=obj.league).first()
+            if pref and pref.team:
+                return {
+                    "team_name": pref.team.name,
+                    "team_logo": pref.team.logo.url if pref.team.logo else None,
+                    "league_name": obj.league.name,
+                    "type": "contextual" 
+                }
+        
+        # 2. GLOBAL FALLBACK
+        # (Only shows if they are a fan and the post isn't league-specific)
+        if user.favorite_team:
+            return {
+                "team_name": user.favorite_team.name,
+                "team_logo": user.favorite_team.logo.url if user.favorite_team.logo else None,
+                "league_name": user.favorite_league.name if user.favorite_league else "Global",
+                "type": "global"
+            }
+
+        return None
+
     def get_original_post(self, obj):
         if obj.parent_post:
-            return ParentPostSerializer(obj.parent_post, context=self.context).data
+            # Recursive call for reposts
+            return PostSerializer(obj.parent_post, context=self.context).data
         return None
 
     def get_author_details(self, obj):
         """
-        Includes Follow status so the PostCard can render the 'Follow' button.
+        Comprehensive author info including trust badges and follow status.
         """
-        # 🚀 1. Access the profile directly via the new 'profile' related_name
         try:
             profile = obj.author.profile
         except AttributeError:
@@ -156,24 +207,19 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         profile_pic = None
         is_following = False
         
-        # 2. Handle Profile Picture URI
+        # Handle Absolute Media URIs for React Native
         if profile and profile.profile_image:
             if request:
-                # Ensures React Native receives the full http:// URL
                 profile_pic = request.build_absolute_uri(profile.profile_image.url)
             else:
                 profile_pic = profile.profile_image.url
 
-        # 3. Check Follow Status for the logged-in user
-        if request and request.user.is_authenticated:
-            # 🚀 IMPORT FOLLOW HERE to avoid Circular Import and Path errors
-            from users.models import Follow 
-            
-            if request.user != obj.author:
-                is_following = Follow.objects.filter(
-                    follower=request.user, 
-                    followed=obj.author
-                ).exists()
+        # Follow logic
+        if request and request.user.is_authenticated and request.user != obj.author:
+            is_following = Follow.objects.filter(
+                follower=request.user, 
+                followed=obj.author
+            ).exists()
 
         return {
             "id": obj.author.id,
@@ -182,8 +228,11 @@ class PostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             "profile_pic": profile_pic,
             "is_following": is_following,
             "followers_count": obj.author.followers.count(),
+            # Status Flags for UI rendering
+            "account_type": obj.author.account_type, # 'fan', 'news', 'organization'
+            "badge_type": obj.author.badge_type,     # 'pioneer', 'superfan', 'official'
+            "fan_badge_text": obj.author.fan_badge,  # e.g., 'Awaiting Partnership'
         }
-
 
 
 class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
@@ -200,6 +249,10 @@ class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
             'id', 'post', 'author_details', 'content', 
             'supporting_info', 'created_at', 'is_owner', 
             'likes_count', 'liked_by_me'
+        ]
+        read_only_fields = [
+            'id', 'post', 'author_details', 'supporting_info', 
+            'created_at', 'is_owner', 'likes_count', 'liked_by_me'
         ]
 
     def get_author_details(self, obj):
@@ -229,6 +282,9 @@ class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
             "username": user.username,
             "display_name": profile.display_name if profile and profile.display_name else user.username,
             "profile_pic": profile_pic,
+            "account_type": user.account_type,
+            "badge_type": user.badge_type,
+            "fan_badge": user.fan_badge,
         }
 
     def get_is_owner(self, obj):

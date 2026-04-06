@@ -58,29 +58,16 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
 
 class OnboardingView(APIView):
-    # This line is the "handshake" that matches your React Native 'api.js'
-    authentication_classes = [TokenAuthentication] 
+    authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
-        preferences_data = request.data.get('fan_preferences', [])
-        append_mode = request.data.get('append_mode', False)
+        serializer = OnboardingSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            user = serializer.save()
+            return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
 
-        # 🚀 THE FIX: Only delete if NOT appending
-        if not append_mode:
-            # Clear existing follows for a fresh start (Onboarding mode)
-            FanPreference.objects.filter(user=user).delete()
-        
-        # Add/Update the new selections
-        for item in preferences_data:
-            FanPreference.objects.update_or_create(
-                user=user,
-                league_id=item['league'],
-                defaults={'team_id': item['team']}
-            )
-
-        return Response({"status": "success"}, status=201)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ProfileListView(generics.ListAPIView):
@@ -116,17 +103,28 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
     authentication_classes = [TokenAuthentication]
     # MultiPartParser is critical for handling Image/File uploads from React Native
     parser_classes = [JSONParser, MultiPartParser, FormParser]
+
     def get_object(self):
-        # This is the "secret sauce" for viewing other profiles
         user_id = self.request.query_params.get('user_id')
-        
+        username = self.request.query_params.get('username')
+
         if user_id:
-            # If the frontend sent ?user_id=X, find that profile
-            profile, created = Profile.objects.get_or_create(user_id=user_id)
-            return profile
-        
-        # Otherwise, return the logged-in user's profile
-        profile, created = Profile.objects.get_or_create(user=self.request.user)
+            try:
+                return Profile.objects.get(user_id=user_id)
+            except Profile.DoesNotExist:
+                user = User.objects.get(id=user_id)
+                profile, _ = Profile.objects.get_or_create(user=user)
+                return profile
+
+        if username:
+            try:
+                return Profile.objects.get(user__username=username)
+            except Profile.DoesNotExist:
+                user = User.objects.get(username=username)
+                profile, _ = Profile.objects.get_or_create(user=user)
+                return profile
+
+        profile, _ = Profile.objects.get_or_create(user=self.request.user)
         return profile
 
     def post(self, request, *args, **kwargs):
@@ -136,31 +134,6 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
         """
         return self.update(request, *args, **kwargs)
 
-    
-    def get_object(self):
-        # 🚀 Look for 'user_id' in the URL params: /api/profile/?user_id=5
-        user_id = self.request.query_params.get('user_id')
-        print(f"DEBUG: Requesting Profile for user_id: {user_id}") # 👈 Check your terminal
-        
-        if user_id:
-            try:
-                return Profile.objects.get(user_id=user_id)
-            except Profile.DoesNotExist:
-                from django.contrib.auth import get_user_model
-                User = get_user_model()
-                user = User.objects.get(id=user_id)
-                return Profile.objects.create(user=user)
-
-        return Profile.objects.get(user=self.request.user)
-
-        
-
-            # Fetch the profile belonging to that specific User ID
-    def get_object(self):
-        profile, created = Profile.objects.get_or_create(user=self.request.user)
-        return profile
-
-        
     def update(self, request, *args, **kwargs):
         """
         Handles the actual update logic. 
