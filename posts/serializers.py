@@ -41,9 +41,11 @@ class SupportLogicMixin:
 
 
 # Assuming Post is imported from your models and SupportLogicMixin is available
+
 class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
     """
-    Updated to include Team and League info for the Quote Box.
+    Updated to include all 5 Badge Types and Account Type logic 
+    for the Quote Box / Repost UI.
     """
     author_details = serializers.SerializerMethodField()
     supporting_info = serializers.SerializerMethodField()
@@ -55,8 +57,42 @@ class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             'supporting_info', 'league', 'created_at'
         ]
 
+    def get_supporting_info(self, obj):
+        """
+        Uses the same logic as the main PostSerializer:
+        Blocks fan support for News/Org accounts to prevent 'Global' fallback.
+        """
+        user = obj.author
+        
+        # 1. Professional Neutrality Guard
+        if user.account_type in ['news', 'organization']:
+            return None
+
+        # 2. League Specific Logic (e.g., NBA, F1)
+        if obj.league:
+            pref = user.fan_preferences.filter(league=obj.league).first()
+            if pref and pref.team:
+                return {
+                    "team_name": pref.team.name,
+                    "team_logo": pref.team.logo.url if pref.team.logo else None,
+                    "type": "contextual"
+                }
+        
+        # 3. Global Fan Fallback
+        if user.favorite_team:
+            return {
+                "team_name": user.favorite_team.name,
+                "team_logo": user.favorite_team.logo.url if user.favorite_team.logo else None,
+                "type": "global"
+            }
+
+        return None
+
     def get_author_details(self, obj):
-        # 🚀 1. Updated for OneToOneField 'profile'
+        """
+        Includes account_type and badge_type so the Quote Box 
+        can show the Gold Check or Pioneer Rocket.
+        """
         try:
             profile = obj.author.profile
         except AttributeError:
@@ -65,7 +101,7 @@ class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
         request = self.context.get('request')
         profile_pic = None
         
-        # 2. Handle Profile Picture URI
+        # Handle Profile Picture URI
         if profile and profile.profile_image:
             if request:
                 profile_pic = request.build_absolute_uri(profile.profile_image.url)
@@ -77,8 +113,9 @@ class ParentPostSerializer(serializers.ModelSerializer, SupportLogicMixin):
             "username": obj.author.username,
             "display_name": profile.display_name if profile and profile.display_name else obj.author.username,
             "profile_pic": profile_pic,
-            "account_type": obj.author.account_type,
-            "badge_type": obj.author.badge_type,
+            # 🚀 Essential for the React Native badge logic
+            "account_type": obj.author.account_type, # 'fan', 'news', 'organization'
+            "badge_type": obj.author.badge_type,     # 'official', 'pioneer', etc.
             "fan_badge": obj.author.fan_badge,
         }
     # The SupportLogicMixin handles get_supporting_info automatically 
