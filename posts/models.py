@@ -65,10 +65,30 @@ class Post(models.Model):
     def __str__(self):
         return f"{self.author.username} - {self.post_type} - {self.league.name}"
 
+    view_count = models.PositiveIntegerField(default=0)
+    like_count = models.PositiveIntegerField(default=0)
+    comment_count = models.PositiveIntegerField(default=0)
+    share_count = models.PositiveIntegerField(default=0)
+
 
 
 
 User = settings.AUTH_USER_MODEL
+
+class VideoEngagement(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='engagements')
+    
+    watch_time = models.FloatField(default=0) 
+    is_completed = models.BooleanField(default=False)
+    rewatched = models.BooleanField(default=False)
+    
+    # ADD THIS: Allows us to see "User X spent 5 minutes watching Premier League today"
+    # without doing complex database joins.
+    league_id = models.IntegerField(null=True, blank=True) 
+    
+    timestamp = models.DateTimeField(auto_now_add=True)
+
 
 class Hashtag(models.Model):
     name = models.CharField(max_length=100, unique=True)

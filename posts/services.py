@@ -101,3 +101,38 @@ def handle_mentions(post_instance):
             )
         except User.DoesNotExist:
             continue
+
+
+from django.db.models import F, ExpressionWrapper, FloatField, Window
+from django.db.models.functions import ExtractDay, ExtractHour
+from django.utils import timezone
+
+def get_personalized_shorts(queryset):
+    """
+    Calculates the Hot Score using pure Database functions.
+    """
+    now = timezone.now()
+    
+    return queryset.annotate(
+        # 1. Calculate total hours since creation: (Days * 24) + Hours
+        # This replaces the .total_seconds() logic
+        age_hours=ExpressionWrapper(
+            (ExtractDay(now - F('created_at')) * 24) + 
+            ExtractHour(now - F('created_at')) + 2.0,
+            output_field=FloatField()
+        ),
+        # 2. Sum up the engagement points
+        engagement_points=ExpressionWrapper(
+            (F('like_count') * 5.0) + 
+            (F('comment_count') * 10.0) + 
+            (F('share_count') * 20.0) + 
+            (F('view_count') * 1.0),
+            output_field=FloatField()
+        )
+    ).annotate(
+        # 3. Calculate Hot Score: Points / (Age ^ 1.5)
+        hot_score=ExpressionWrapper(
+            F('engagement_points') / (F('age_hours') ** 1.5),
+            output_field=FloatField()
+        )
+    ).order_by('-hot_score')

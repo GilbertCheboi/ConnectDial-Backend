@@ -173,22 +173,19 @@ class PostViewSet(viewsets.ModelViewSet):
     def like(self, request, pk=None):
         post = self.get_object()
         user = request.user
-        
-        # Toggle Logic: If exists, delete it. If not, create it.
         like_queryset = PostLike.objects.filter(post=post, user=user)
         
         if like_queryset.exists():
             like_queryset.delete()
+            post.like_count = max(0, post.like_count - 1) # Decrement counter
             liked = False
         else:
             PostLike.objects.create(post=post, user=user)
+            post.like_count += 1 # Increment counter
             liked = True
             
-        # Return the new counts so the frontend can update instantly
-        return Response({
-            'liked': liked,
-            'likes_count': post.likes.count()
-        }, status=status.HTTP_200_OK)  
+        post.save(update_fields=['like_count']) # Persist to DB for algorithm
+        return Response({'liked': liked, 'likes_count': post.like_count})
 
      
     @action(
@@ -259,59 +256,42 @@ from posts.serializers import PostSerializer
 
 
 
+# posts/views.py
+from .services import get_personalized_shorts
+
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Personalized Shorts feed filtered by the user's followed leagues.
-    Supports both physical .mp4 files and YouTube link content.
-    """
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
         
-        # 1. FIX: Filter for items marked as shorts that have EITHER:
-        # a) A physical video file (.mp4)
-        # b) A YouTube link in the content (from your tasks)
-        queryset = Post.objects.filter(
-            is_short=True
-        ).filter(
+        # 1. Basic filtering for video content
+        queryset = Post.objects.filter(is_short=True).filter(
             Q(media_file__icontains='.mp4') | 
             Q(content__icontains='youtube.com') | 
             Q(content__icontains='youtu.be')
         )
 
-        # 2. Filter by the leagues the user follows
-        # Accessing the 'fan_preferences' relationship on the User model
+        # 2. League filtering
         followed_league_ids = user.fan_preferences.values_list('league_id', flat=True)
-        
         if followed_league_ids.exists():
             queryset = queryset.filter(league_id__in=followed_league_ids)
-        else:
-            # Fallback: If they follow NOTHING, show all shorts so the screen isn't empty.
-            # We don't filter further here, allowing 'queryset' to remain as is.
-            pass 
 
-        # 3. Optimized fetching (Performance boost for your local server)
-        queryset = queryset.select_related(
-            'author', 
-            'league', 
-            'team', 
-            'author__profile'
-        ).prefetch_related('hashtags')
+        # 3. Optimization
+        queryset = queryset.select_related('author', 'league', 'team').prefetch_related('hashtags')
 
-        # 4. Annotate counts for the React Native UI overlays
-        queryset = queryset.annotate(
-            likes_count=Count('likes', distinct=True),
-            comments_count=Count('comments', distinct=True)
-        )
+        # 4. Inject the Algorithm Math 🚀
+        # This function handles the .order_by('-hot_score') for you!
+        queryset = get_personalized_shorts(queryset)
 
-        # 5. Check if the current user liked this specific short
+        # 5. User-specific "Liked" context
         user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-        queryset = queryset.annotate(user_has_liked=Exists(user_likes))
+        
+        # ✅ REMOVED the .order_by('-created_at') here to keep the Hot Score ranking
+        return queryset.annotate(user_has_liked=Exists(user_likes))
 
-        # 6. Return newest first
-        return queryset.order_by('-created_at')
+
 class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Post.objects.all()
     serializer_class = PostSerializer
@@ -402,3 +382,39 @@ class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
         trending_tags = get_trending_hashtags(limit=10, days=1)
         serializer = self.get_serializer(trending_tags, many=True)
         return Response(serializer.data)
+
+
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Post, VideoEngagement
+
+class RecordEngagementView(APIView):
+    """
+    Endpoint called by React Native when a user finishes watching a video
+    or swipes away.
+    """
+    def post(self, request):
+        post_id = request.data.get('post_id')
+        watch_time = request.data.get('watch_time') # In seconds
+        completed = request.data.get('completed', False)
+        
+        try:
+            post = Post.objects.get(id=post_id)
+            
+            # 1. Create the engagement record for the algorithm
+            VideoEngagement.objects.create(
+                user=request.user if request.user.is_authenticated else None,
+                post=post,
+                watch_time=watch_time,
+                is_completed=completed,
+                league_id=post.league.id # Helping the 'Interest Link'
+            )
+            
+            # 2. Update the main counter on the Post for the Hot Score
+            post.view_count += 1
+            post.save(update_fields=['view_count'])
+            
+            return Response({"status": "success"}, status=status.HTTP_201_CREATED)
+        except Post.DoesNotExist:
+            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)

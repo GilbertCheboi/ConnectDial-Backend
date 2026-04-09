@@ -2,6 +2,9 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 from .models import Post
 from .services import process_post_metadata, handle_mentions
+from django.db.models import F, ExpressionWrapper, FloatField, Count
+from django.utils import timezone
+from datetime import timedelta
 
 @receiver(post_save, sender=Post)
 def handle_post_extras(sender, instance, created, **kwargs):
@@ -41,3 +44,5 @@ def trigger_push_notification(sender, instance, created, **kwargs):
             'mention': f"{instance.sender.username} mentioned you in a post", # 🚀 Added
         }
         # ... rest of your task.delay logic ...
+
+
