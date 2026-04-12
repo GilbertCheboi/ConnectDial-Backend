@@ -192,7 +192,7 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=30, hour='*/4'),
         'args': ('Kenya Premier League', 3),
     },
-
+                                        
     # --- 3. YOUTUBE SHORTS CONTENT (Staggered every 8-12 Hours) ---
     # Visual content is expensive for quotas; we've moved these to 2-3 times daily.
     'post-premier-league-shorts': {

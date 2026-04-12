@@ -11,16 +11,13 @@ class UserMiniSerializer(serializers.ModelSerializer):
         fields = ['id', 'username', 'account_type', 'badge_type', 'fan_badge']
 
 class SupportLogicMixin:
-    """
-    Reusable logic for both Posts and Comments to find which 
-    team the user supports in the specific league of the content.
-    """
     def get_supporting_info(self, obj):
-        # 'obj' is either a Post or a Comment
         author = obj.author if hasattr(obj, 'author') else obj.user
         
-        # We need the league of the post to filter the user's teams
-        # If it's a comment, we look at the parent post's league
+        # 1. FIX: Check the specific author's account type, not the User class
+        if hasattr(author, 'account_type') and author.account_type in ['news', 'organization']:
+            return None 
+
         target_league = getattr(obj, 'league', None)
         if not target_league and hasattr(obj, 'post'):
             target_league = obj.post.league
@@ -28,17 +25,19 @@ class SupportLogicMixin:
         if not target_league:
             return None
 
-        # Look for the specific team this user picked for THIS league
-        pref = author.fan_preferences.filter(league=target_league).select_related('team', 'league').first()
-        
-        if pref:
+        pref = author.fan_preferences.filter(
+            league=target_league
+        ).select_related('team', 'league').first()
+
+        # 2. FIX: Ensure BOTH the preference and the team exist before accessing .name
+        if pref and pref.team:
             return {
                 "team_name": pref.team.name,
                 "league_name": pref.league.name,
                 "text": f"Supports {pref.team.name}"
             }
+            
         return None
-
 
 # Assuming Post is imported from your models and SupportLogicMixin is available
 
@@ -273,7 +272,6 @@ class PostSerializer(serializers.ModelSerializer):
 
 
 class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
-    # 🚀 Changed: We are now defining author_details manually for total control
     author_details = serializers.SerializerMethodField()
     supporting_info = serializers.SerializerMethodField()
     is_owner = serializers.SerializerMethodField()
@@ -287,41 +285,37 @@ class CommentSerializer(serializers.ModelSerializer, SupportLogicMixin):
             'supporting_info', 'created_at', 'is_owner', 
             'likes_count', 'liked_by_me'
         ]
+        # 🚀 Only include fields that the user SHOULD NOT be able to change
+        # 'content' and 'post' must be excluded from here to be writeable
         read_only_fields = [
-            'id', 'post', 'author_details', 'supporting_info', 
-            'created_at', 'is_owner', 'likes_count', 'liked_by_me'
+            'id', 
+            'author_details', 
+            'supporting_info', 
+            'created_at', 
+            'is_owner', 
+            'likes_count', 
+            'liked_by_me'
         ]
 
     def get_author_details(self, obj):
-        """
-        Mirroring the PostSerializer logic to ensure profile image 
-        and display name work every time.
-        """
         user = obj.user
-        try:
-            profile = user.profile
-        except AttributeError:
-            profile = None
-            
+        profile = getattr(user, 'profile', None)
         request = self.context.get('request')
-        profile_pic = None
         
-        # 1. Handle Profile Picture URI (Full URL for React Native)
+        profile_pic = None
         if profile and profile.profile_image:
-            if request:
-                profile_pic = request.build_absolute_uri(profile.profile_image.url)
-            else:
-                profile_pic = profile.profile_image.url
+            # build_absolute_uri is critical for images to show on React Native
+            profile_pic = request.build_absolute_uri(profile.profile_image.url) if request else profile.profile_image.url
 
-        # 2. Construct the exact same object structure as PostSerializer
         return {
             "id": user.id,
             "username": user.username,
             "display_name": profile.display_name if profile and profile.display_name else user.username,
             "profile_pic": profile_pic,
-            "account_type": user.account_type,
-            "badge_type": user.badge_type,
-            "fan_badge": user.fan_badge,
+            # 🚀 These fields are required for your UI badge logic
+            "account_type": getattr(user, 'account_type', 'fan'), 
+            "badge_type": getattr(user, 'badge_type', None),      
+            "fan_badge": getattr(user, 'fan_badge', None),        
         }
 
     def get_is_owner(self, obj):
