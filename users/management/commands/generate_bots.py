@@ -10,7 +10,7 @@ from leagues.models import League, Team
 User = get_user_model()
 
 class Command(BaseCommand):
-    help = 'Generates 10,000+ high-fidelity bots with Authentic Kenyan and International identities'
+    help = 'Generates high-fidelity bots (Fans, News, and Organizations)'
 
     def add_arguments(self, parser):
         parser.add_argument('total', type=int, help='Number of bots to create')
@@ -19,125 +19,97 @@ class Command(BaseCommand):
         total = options['total']
         
         # --- IDENTITY POOLS ---
+        ke_first = ["Kevin", "Brian", "Evans", "Emmanuel", "Collins", "Victor", "Jane", "Mercy", "Faith", "Joy"]
+        ke_ethnic = ["Kipchoge", "Moraa", "Kamau", "Njeri", "Odhiambo", "Makena", "Kibet", "Waweru"]
         
-        # Authentic Kenyan: English First + Traditional Surname
-        ke_first = ["Kevin", "Brian", "John", "James", "Evans", "Emmanuel", "Geoffrey", "Collins", 
-                    "Victor", "Peter", "David", "Joseph", "Mary", "Mercy", "Faith", "Alice", 
-                    "Stacy", "Sharon", "Joy", "Grace", "Cynthia", "Beatrice", "Diana", "Phyllis"]
-        
-        ke_ethnic = ["Kipchoge", "Moraa", "Kamau", "Njeri", "Odhiambo", "Makena", "Kimani", "Syokau", 
-                     "Mutua", "Chepngetich", "Kibet", "Waweru", "Atieno", "Maina", "Kariuki", 
-                     "Otieno", "Wekesa", "Cheruiyot", "Nduta", "Keter", "Mulei", "Okafor", "Mboya"]
-        
-        # International (NBA/NFL/F1 focus)
-        int_first = ["Jordan", "LeBron", "Dak", "Brady", "Giannis", "Sloane", "Cooper", "Xavier", 
-                     "Skylar", "Jaxon", "Maddox", "Luka", "Zion", "Kyrie", "Tyreek", "Chase"]
-        int_last = ["West", "Rivers", "Miller", "Stone", "Vettel", "Hamilton", "Ricciardo", 
-                    "Verstappen", "Bryant", "James", "Mahomes", "Kelce", "Stroud", "Wolff"]
+        int_first = ["Jordan", "LeBron", "Giannis", "Luka", "Zion", "Kyrie", "Lewis", "Max"]
+        int_last = ["West", "Rivers", "Miller", "Stone", "Hamilton", "Verstappen", "Bryant"]
+
+        # News & Org Names
+        news_prefixes = ["Daily", "Global", "Sports", "Fanatic", "Inside", "The", "Rapid"]
+        news_suffixes = ["News", "Updates", "Report", "Central", "Hub", "Network"]
+        org_types = ["Foundation", "Academy", "Agency", "Group", "Sports Club"]
 
         leagues = list(League.objects.all())
         if not leagues:
-            self.stdout.write(self.style.ERROR('❌ No leagues found. Ensure NBA, F1, etc. exist in DB.'))
+            self.stdout.write(self.style.ERROR('❌ No leagues found.'))
             return
 
-        self.stdout.write(f"🚀 Deploying {total} bots to ConnectDial (Target: PostgreSQL)...")
-
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0...'}
 
         for i in range(total):
-            # 1. WEIGHTED IDENTITY SELECTION (75% Kenyan / 25% International)
-            is_international = random.random() < 0.25 
-            
-            if is_international:
-                f_name = random.choice(int_first)
-                l_name = random.choice(int_last)
-                region_tag = random.choice(["American", "Hispanic", "European", "Mixed-race"])
+            # 1. DETERMINE ACCOUNT TYPE (Weighted)
+            # 90% Fan, 7% News, 3% Organization
+            rand_val = random.random()
+            if rand_val < 0.90:
+                acc_type = 'fan'
+                badge = 'none'
+            elif rand_val < 0.97:
+                acc_type = 'news'
+                badge = 'official'
             else:
-                f_name = random.choice(ke_first)
-                l_name = random.choice(ke_ethnic)
-                region_tag = random.choice(["African", "Black"])
+                acc_type = 'organization'
+                badge = 'verified'
 
-            # 2. CREDENTIALS (6-digit suffix for 10k scale safety)
-            suffix = random.randint(100000, 999999)
-            username = f"{f_name.lower()}_{l_name.lower()}_{suffix}"
-            
-            # 3. LEAGUE & TEAM ASSIGNMENT
+            # 2. GENERATE IDENTITY BASED ON TYPE
+            suffix = random.randint(1000, 9999)
             fav_league = random.choice(leagues)
-            teams_in_league = list(Team.objects.filter(league=fav_league))
             
-            if not teams_in_league:
-                fav_team, _ = Team.objects.get_or_create(name=f"{fav_league.name} Fanatic", league=fav_league)
-            else:
-                fav_team = random.choice(teams_in_league)
+            if acc_type == 'fan':
+                is_international = random.random() < 0.25
+                f_name = random.choice(int_first if is_international else ke_first)
+                l_name = random.choice(int_last if is_international else ke_ethnic)
+                display_name = f"{f_name} {l_name}"
+                username = f"{f_name.lower()}_{l_name.lower()}_{suffix}"
+                bio = f"Massive {fav_league.name} supporter. #ConnectDial"
+                search_term = "portrait,person"
+            
+            elif acc_type == 'news':
+                name_part = random.choice(news_prefixes)
+                display_name = f"{name_part} {fav_league.name} {random.choice(news_suffixes)}"
+                username = display_name.replace(" ", "_").lower() + f"_{suffix}"
+                bio = f"Official source for all things {fav_league.name}. Breaking news and updates."
+                search_term = "news,studio,microphone"
 
-            # 4. DATABASE PERSISTENCE
+            else:  # Organization
+                display_name = f"{fav_league.name} {random.choice(org_types)}"
+                username = display_name.replace(" ", "_").lower() + f"_{suffix}"
+                bio = f"Supporting the growth of {fav_league.name} worldwide. Official Account."
+                search_term = "office,building,logo"
+
+            # 3. DATABASE PERSISTENCE
             try:
                 user = User.objects.create(
                     username=username,
                     email=f"bot_{suffix}@connectdial.com",
                     favorite_league=fav_league,
-                    favorite_team=fav_team,
-                    fan_badge="Pro Fan"
+                    account_type=acc_type, # 🚀 Sets 'fan', 'news', or 'organization'
+                    fan_badge=badge        # 🚀 Sets 'official', 'verified', etc.
                 )
                 user.set_password('connect_bot_2026')
                 user.save()
 
-                # 5. PROFILE CUSTOMIZATION
                 profile, _ = Profile.objects.get_or_create(user=user)
-                profile.display_name = f"{f_name} {l_name}"
+                profile.display_name = display_name
                 profile.is_bot = True
-                
-                # Variety in bios prevents "Uncanny Valley" effect
-                bios = [
-                    f"Massive {fav_team.name} supporter. Tracking {fav_league.name} 24/7! ⚽🏎️",
-                    f"{fav_league.name} enthusiast. {fav_team.name} to the world! 😤",
-                    f"Just here for the {fav_team.name} highlights. #ConnectDial",
-                    f"Analyzing every {fav_league.name} play. Go {fav_team.name}!",
-                    f"Game day is every day. 📍 Location: Kenya | Team: {fav_team.name}",
-                    f"Stats, scores, and vibes. {fav_league.name} insider. 🏀"
-                ]
-                profile.bio = random.choice(bios)
+                profile.bio = bio
                 profile.save()
 
-                # 6. VISUAL IDENTITY (Face + Stadium Banner)
-                gender = random.choice(["man", "woman"])
-                self.stdout.write(f"  [{i+1}/{total}] 📸 Fetching {region_tag} {gender} for {username}...")
-
-                # --- PROFILE IMAGE (PFP) ---
+                # 4. VISUAL IDENTITY
+                self.stdout.write(f"  [{i+1}/{total}] Creating {acc_type}: {username}...")
+                
+                # Dynamic Profile Image based on search_term
                 try:
-                    # sig ensures unique image per request
-                    face_url = f"https://source.unsplash.com/featured/400x400/?{region_tag},{gender},portrait&sig={random.randint(1, 99999)}"
-                    face_res = requests.get(face_url, headers=headers, timeout=8, allow_redirects=True)
-                    
-                    if face_res.status_code != 200:
-                        # Fallback if Unsplash throttles
-                        face_res = requests.get(f"https://loremflickr.com/400/400/{region_tag},{gender},person/all", timeout=8)
-
+                    face_url = f"https://source.unsplash.com/featured/400x400/?{search_term}&sig={random.randint(1, 999)}"
+                    face_res = requests.get(face_url, headers=headers, timeout=5)
                     if face_res.status_code == 200:
                         profile.profile_image.save(f"pfp_{user.id}.jpg", ContentFile(face_res.content), save=True)
-                except Exception as e:
-                    self.stdout.write(self.style.WARNING(f"    🚫 PFP skip: {e}"))
-
-                # --- BANNER IMAGE ---
-                try:
-                    sport_key = fav_league.name.split()[0]
-                    banner_url = f"https://loremflickr.com/1200/400/stadium,{sport_key}/all"
-                    banner_res = requests.get(banner_url, timeout=8)
-                    if banner_res.status_code == 200:
-                        profile.banner_image.save(f"banner_{user.id}.jpg", ContentFile(banner_res.content), save=True)
                 except:
                     pass
 
-                # 7. LOG FAN PREFERENCE
-                FanPreference.objects.get_or_create(user=user, league=fav_league, team=fav_team)
-
             except Exception as e:
-                self.stdout.write(self.style.ERROR(f"❌ Failed bot {username}: {e}"))
+                self.stdout.write(self.style.ERROR(f"❌ Error: {e}"))
 
-            # 8. RATE LIMIT PROTECTION
-            # 1.2s sleep is recommended to avoid getting your IP banned by Unsplash/Flickr
-            time.sleep(1.2)
+            time.sleep(1) # HP 290 Safety
 
-        self.stdout.write(self.style.SUCCESS(f'✅ Successfully deployed {total} bots to the {fav_league.name} and beyond!'))
+        self.stdout.write(self.style.SUCCESS(f'✅ Finished generating {total} mixed-type bots.'))

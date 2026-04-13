@@ -13,7 +13,7 @@ class Command(BaseCommand):
         # 1. Get posts from the last 24 hours
         recent_posts = Post.objects.filter(
             created_at__gte=timezone.now() - timezone.timedelta(hours=24)
-        )
+        ).order_by('?')[:10]
 
         if not recent_posts.exists():
             self.stdout.write("No recent posts found.")
