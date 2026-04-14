@@ -7,21 +7,64 @@ from django.utils import timezone
 User = get_user_model()
 
 class Command(BaseCommand):
-    help = 'Forces bots to interact ONLY with leagues they follow'
+    help = 'Bots interact intelligently with posts based on content analysis'
+
+    def get_intelligent_response(self, content, subject):
+        """Analyzes post content to return a contextual response."""
+        content = content.lower()
+        
+        # 1. Reaction Pools
+        reactions = {
+            "praise": [
+                f"Absolute class from {subject}! 🔥",
+                f"This is why we love {subject}. What a moment!",
+                f"Incredible performance by {subject}. Top tier!",
+                f"The standard is being set by {subject} today. 👏"
+            ],
+            "excitement": [
+                f"The atmosphere for {subject} must be insane right now!",
+                "I'm literally on the edge of my seat watching this! 🍿",
+                f"Big moves! {subject} is cooking something special this season.",
+                f"Can't wait to see how this plays out for {subject}!"
+            ],
+            "analysis": [
+                f"Stats don't lie, {subject} is dominating the play right now.",
+                "Tactically, this is a masterpiece.",
+                f"Interesting perspective on {subject}. Hadn't thought of it that way.",
+                f"This changes everything for the {subject} standings."
+            ],
+            "generic": [
+                f"Great update on {subject}. Thanks for sharing!",
+                f"Always keeping an eye on {subject}. #ConnectDial",
+                "Quality content. This is exactly why I joined ConnectDial.",
+                "Keep these updates coming! 📈"
+            ]
+        }
+
+        # 2. Keyword Matching Logic
+        if any(word in content for word in ["win", "goal", "champion", "amazing", "great", "fire", "win"]):
+            category = "praise"
+        elif any(word in content for word in ["breaking", "news", "official", "signed", "contract", "update"]):
+            category = "excitement"
+        elif any(word in content for word in ["stats", "analysis", "tactics", "think", "review", "history"]):
+            category = "analysis"
+        else:
+            category = "generic"
+
+        return random.choice(reactions[category])
 
     def handle(self, *args, **options):
-        # 1. Get posts from the last 24 hours
+        # 1. LIMIT: Only pick 10-15 random recent posts to prevent "spamming" the feed
         recent_posts = Post.objects.filter(
             created_at__gte=timezone.now() - timezone.timedelta(hours=24)
-        ).order_by('?')[:10]
+        ).order_by('?')[:15]
 
         if not recent_posts.exists():
             self.stdout.write("No recent posts found.")
             return
 
         for post in recent_posts:
-            # 2. MATCHING LOGIC: Find fans of this specific league
-            # We filter by the league mandatory, and team if the post has one
+            # 2. MATCHING LOGIC: Find bots that follow this specific league
             eligible_bots = User.objects.filter(
                 profile__is_bot=True,
                 favorite_league=post.league
@@ -30,44 +73,50 @@ class Command(BaseCommand):
             if not eligible_bots.exists():
                 continue
 
-            # 3. FIX: Changed 'order_size' to 'order_by'
+            # 3. SELECT PARTICIPANTS: 1 or 2 bots per post
             num_engagers = random.randint(1, 2)
             participants = eligible_bots.order_by('?')[:num_engagers]
 
             for bot in participants:
-                # Check if they already liked it to avoid duplicates
-                if PostLike.objects.filter(user=bot, post=post).exists():
+                # 4. AVOID DUPLICATES: Don't interact with the same post twice
+                if PostLike.objects.filter(user=bot, post=post).exists() or \
+                   Comment.objects.filter(user=bot, post=post).exists():
                     continue
 
                 action = random.choice(['like', 'comment', 'repost'])
+                subject = post.team.name if post.team else post.league.name
 
                 if action == 'like':
                     PostLike.objects.get_or_create(user=bot, post=post)
-                    self.stdout.write(f"❤️ {bot.username} (Fan of {post.league.name}) liked a post.")
+                    self.stdout.write(f"❤️ {bot.username} liked a {subject} post.")
 
                 elif action == 'comment':
-                    # Use the post's team name if available, otherwise league name
-                    subject = post.team.name if post.team else post.league.name
-                    comments = [
-                        f"Big moves for {subject}! 🔥",
-                        "This is exactly what the league needed.",
-                        "Finally some real updates. ConnectDial is the place to be!",
-                        f"Watching {subject} closely this season. Great post!"
-                    ]
-                    Comment.objects.create(user=bot, post=post, content=random.choice(comments))
-                    self.stdout.write(f"💬 {bot.username} commented on a {post.league.name} post.")
+                    content = self.get_intelligent_response(post.content, subject)
+                    Comment.objects.create(user=bot, post=post, content=content)
+                    self.stdout.write(f"💬 {bot.username}: {content}")
 
                 elif action == 'repost':
-                    # Ensure the repost carries the league and team ID
+                    # 5. AVOID REPOST SPAM: Check if this bot already reposted THIS specific post
+                    if Post.objects.filter(author=bot, parent_post=post, is_repost=True).exists():
+                        continue
+
+                    repost_quotes = [
+                        f"If you're following {post.league.name}, you need to see this update on {subject}.",
+                        f"Huge news regarding {subject}. Keeping my eyes on this! 👇",
+                        f"This is a massive development for {subject}. Worth a share!",
+                        f"Directly from the source. Great news for the {subject} fans.",
+                        f"ConnectDial always has the fastest updates on {subject}. Check this out!"
+                    ]
+
                     Post.objects.create(
                         author=bot,
-                        content=f"You guys need to see this! #{post.league.name.replace(' ', '')}",
+                        content=random.choice(repost_quotes),
                         post_type='text',
                         league=post.league,
                         team=post.team,
                         parent_post=post,
                         is_repost=True
                     )
-                    self.stdout.write(f"🔄 {bot.username} shared a {post.league.name} update.")
+                    self.stdout.write(f"🔄 {bot.username} shared a {subject} update.")
 
-        self.stdout.write(self.style.SUCCESS("✅ Targeted engagement complete!"))
+        self.stdout.write(self.style.SUCCESS("✅ Intelligent engagement complete!"))
