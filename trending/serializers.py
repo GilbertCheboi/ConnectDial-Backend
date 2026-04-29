@@ -27,6 +27,8 @@ class TrendingPostSerializer(serializers.ModelSerializer):
             'likes_count',
             'comments_count',
             'shares_count',
+            'author_badge_type', 
             'created_at',
+            'author_account_type',
         ]
 
