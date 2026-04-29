@@ -28,7 +28,7 @@ from .views import (
 )
 
 urlpatterns = [
-
+    
     # ── Core auth ────────────────────────────────────────────────
     path('login/',         CustomLoginView.as_view(),  name='rest_login'),
     path('register/',      RegisterView.as_view(),      name='register'),

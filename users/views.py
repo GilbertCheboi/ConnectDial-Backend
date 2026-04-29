@@ -20,7 +20,6 @@ from .serializers import (
     OnboardingSerializer,
     ProfileSerializer,
     TwoFAToggleSerializer,
-    # CustomLoginSerializer is wired via REST_AUTH settings, not used directly in views
 )
 
 
@@ -49,12 +48,6 @@ def _send_otp_email(user, otp_code, subject, purpose_label):
 
 
 def _issue_scoped_token(user, scope: str, lifetime: timedelta) -> str:
-    """
-    Issues a short-lived AccessToken with a custom 'scope' claim.
-    Used for two_fa_pending and password_reset flows.
-    We use 'scope' (not 'token_type') so we don't conflict with
-    SimpleJWT's internal token_type validation.
-    """
     token = AccessToken.for_user(user)
     token.set_exp(lifetime=lifetime)
     token['scope'] = scope
@@ -62,10 +55,6 @@ def _issue_scoped_token(user, scope: str, lifetime: timedelta) -> str:
 
 
 def _decode_scoped_token(raw_token: str, expected_scope: str):
-    """
-    Decodes and validates a scoped AccessToken.
-    Returns the User if valid, raises ValueError on any failure.
-    """
     try:
         token = AccessToken(raw_token)
     except Exception:
@@ -122,8 +111,8 @@ def _get_user_by_identifier(identifier: str):
 # ==================== AUTH VIEWS ====================
 
 class CustomLoginView(APIView):
-    permission_classes  = [AllowAny]
-    throttle_classes    = [LoginThrottle]
+    permission_classes = [AllowAny]
+    throttle_classes   = [LoginThrottle]
 
     def post(self, request):
         identifier = (request.data.get('username') or request.data.get('email', '')).strip()
@@ -168,15 +157,43 @@ class GoogleSignInView(APIView):
         if not raw_token:
             return Response({'error': 'id_token is required.'}, status=400)
 
-        try:
-            client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
-            idinfo    = google_id_token.verify_oauth2_token(raw_token, google_requests.Request(), client_id)
-        except ValueError as e:
-            return Response({'error': f'Invalid Google token: {e}'}, status=401)
+        # ✅ Try multiple client IDs — Android and Web
+        # React Native sends a token signed for the Android client
+        # but Django must verify against the Web client ID
+        client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
+
+        print(f"🔍 Using client_id: {client_id}")
+        print(f"🔍 Token prefix: {raw_token[:50]}")
+
+        idinfo = None
+
+        # ✅ Try verifying against both Web and Android client IDs
+        client_ids_to_try = [
+            client_id,  # Web client ID from .env
+            '849401797302-h2a3b2jhvru6fthok0rbb9b66mamhcce.apps.googleusercontent.com',  # Android client ID
+        ]
+
+        for cid in client_ids_to_try:
+            try:
+                idinfo = google_id_token.verify_oauth2_token(
+                    raw_token,
+                    google_requests.Request(),
+                    cid,
+                )
+                print(f"✅ Token verified with client_id: {cid}")
+                break
+            except ValueError as e:
+                print(f"⚠️ Failed with client_id {cid}: {e}")
+                continue
+
+        if idinfo is None:
+            return Response({'error': 'Invalid Google token. Could not verify with any client ID.'}, status=401)
 
         email = idinfo.get('email')
         if not email or not idinfo.get('email_verified', False):
             return Response({'error': 'Invalid or unverified Google email.'}, status=400)
+
+        print(f"✅ Google email verified: {email}")
 
         try:
             user    = User.objects.get(email__iexact=email)
@@ -197,7 +214,12 @@ class GoogleSignInView(APIView):
             created = False
 
         SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
-        return Response(_jwt_response(user, {'is_new_user': created}), status=200)
+
+        response_data = _jwt_response(user, {'is_new_user': created})
+        print(f"✅ Returning JWT for user: {user.username}, is_new_user: {created}")
+        print(f"✅ Response keys: {list(response_data.keys())}")
+
+        return Response(response_data, status=200)
 
 
 # ==================== TWO-FACTOR AUTH VIEWS ====================
@@ -290,7 +312,6 @@ class ForgotPasswordRequestView(APIView):
 
         user = _get_user_by_identifier(identifier)
 
-        # Always return success to prevent user enumeration
         if user and user.is_active:
             otp_obj = PasswordResetOTP.generate_for(user)
             try:
@@ -436,16 +457,14 @@ class LogoutView(APIView):
     permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        # Blacklist the refresh token so it can't be reused after logout
         try:
             refresh_token = request.data.get('refresh', '').strip()
             if refresh_token:
                 token = RefreshToken(refresh_token)
                 token.blacklist()
         except Exception:
-            pass  # token may already be blacklisted or invalid — proceed anyway
+            pass
 
-        # Clear FCM token so the device stops receiving push notifications
         if hasattr(request.user, 'profile'):
             profile = request.user.profile
             profile.fcm_token = None

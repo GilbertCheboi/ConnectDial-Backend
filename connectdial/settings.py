@@ -17,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get('SECRET_KEY')
 DEBUG      = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['192.168.100.107', '192.168.0.114', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4']
+ALLOWED_HOSTS = ['192.168.100.107', '10.116.190.93',' 192.168.139.30', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4','startechserviceses.com', 'www.startechserviceses.com']
 
 AUTH_USER_MODEL = 'users.User'
 SITE_ID         = 1
@@ -25,7 +25,7 @@ SITE_ID         = 1
 
 # ─────────────────────────────────────────────
 # Application definition
-# ─────────────────────────────────────────────
+# ───────────────────────────────────────────── 
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -294,3 +294,5 @@ REST_AUTH = {
     'USER_DETAILS_SERIALIZER':    'users.serializers.UserSerializer',   # controls user payload shape
     'LOGIN_SERIALIZER':           'users.serializers.CustomLoginSerializer',
 }
+# At the bottom of settings.py
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
