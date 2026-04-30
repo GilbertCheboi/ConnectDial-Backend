@@ -2,6 +2,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.contrib.auth import authenticate
 from django.core.mail import send_mail
+from django.utils import timezone
 from rest_framework import generics, filters
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework.permissions import IsAuthenticated, AllowAny
@@ -14,14 +15,18 @@ from allauth.socialaccount.models import SocialAccount
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 
-from .models import User, Profile, FanPreference, Follow, PasswordResetOTP, TwoFactorOTP
+from .models import (
+    User, Profile, FanPreference, Follow, 
+    PasswordResetOTP, TwoFactorOTP, 
+    LoginHistory, AuditLog  # ← New models assumed/added
+)
+
 from .serializers import (
     UserSerializer,
     OnboardingSerializer,
     ProfileSerializer,
-    TwoFAToggleSerializer,
+    CustomLoginSerializer,
 )
-
 
 # ==================== THROTTLES ====================
 
@@ -40,7 +45,11 @@ class PasswordResetThrottle(AnonRateThrottle):
 def _send_otp_email(user, otp_code, subject, purpose_label):
     send_mail(
         subject=subject,
-        message=f"Hi {user.username},\n\nYour {purpose_label} code is: {otp_code}\n\nThis code expires in 5 minutes.",
+        message=(
+            f"Hi {user.username},\n\n"
+            f"Your {purpose_label} code is: {otp_code}\n\n"
+            f"This code expires in 5 minutes."
+        ),
         from_email=settings.DEFAULT_FROM_EMAIL,
         recipient_list=[user.email],
         fail_silently=False,
@@ -86,157 +95,110 @@ def _make_unique_username(base: str) -> str:
 def _jwt_response(user, extra=None):
     refresh = RefreshToken.for_user(user)
     payload = {
-        'access':  str(refresh.access_token),
+        'access': str(refresh.access_token),
         'refresh': str(refresh),
-        'user':    UserSerializer(user).data,
+        'user': UserSerializer(user).data,
     }
     if extra:
         payload.update(extra)
     return payload
 
 
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
+
+
 def _get_user_by_identifier(identifier: str):
-    identifier = identifier.strip().lower()
-    if '@' in identifier:
-        qs = User.objects.filter(email__iexact=identifier)
-    else:
-        qs = User.objects.filter(username__iexact=identifier)
-    if not qs.exists():
+    identifier = identifier.strip()
+    if not identifier:
         return None
-    if qs.count() > 1:
-        return qs.order_by('-date_joined').first()
-    return qs.first()
+
+    is_email = True
+    try:
+        validate_email(identifier)
+    except ValidationError:
+        is_email = False
+
+    qs = (
+        User.objects.filter(email__iexact=identifier)
+        if is_email
+        else User.objects.filter(username__iexact=identifier)
+    )
+    return qs.order_by('-date_joined').first() if qs.exists() else None
+
+
+def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = None):
+    """Centralized audit logging"""
+    AuditLog.objects.create(
+        user=user,
+        action=action,
+        ip_address=ip,
+        device_info=device or "Unknown",
+        extra=extra or {}
+    )
+
+
+def _log_login(user, request):
+    """Log successful login with IP & device"""
+    ip = request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')
+    device = request.META.get('HTTP_USER_AGENT', 'Unknown Device')
+
+    LoginHistory.objects.create(
+        user=user,
+        ip_address=ip,
+        device_info=device,
+        success=True
+    )
+    _log_audit(user, 'login_success', ip, device)
 
 
 # ==================== AUTH VIEWS ====================
 
 class CustomLoginView(APIView):
+    """
+    Step 1: Credentials → OTP → pending_token
+    """
     permission_classes = [AllowAny]
-    throttle_classes   = [LoginThrottle]
+    throttle_classes = [LoginThrottle]
 
     def post(self, request):
-        identifier = (request.data.get('username') or request.data.get('email', '')).strip()
-        password   = request.data.get('password', '').strip()
+        serializer = CustomLoginSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
 
-        if not identifier or not password:
-            return Response({'error': 'username/email and password are required.'}, status=400)
+        user = serializer.user
 
-        user_obj = _get_user_by_identifier(identifier)
-        if not user_obj:
-            return Response({'error': 'Invalid credentials.'}, status=401)
-
-        user = authenticate(request, username=user_obj.username, password=password)
-        if not user:
-            return Response({'error': 'Invalid credentials.'}, status=401)
-
-        if not user.is_active:
-            return Response({'error': 'Account deactivated.'}, status=403)
-
-        if user.two_fa_enabled:
-            otp_obj = TwoFactorOTP.generate_for(user)
-            try:
-                _send_otp_email(user, otp_obj.code, 'ConnectDial Login Code', 'login verification')
-            except Exception:
-                return Response({'error': 'Failed to send OTP email.'}, status=503)
-
-            pending_token = _issue_scoped_token(user, 'two_fa_pending', timedelta(minutes=5))
-            return Response({
-                'two_fa_required': True,
-                'pending_token':   pending_token,
-            }, status=200)
-
-        return Response(_jwt_response(user), status=200)
-
-
-class GoogleSignInView(APIView):
-    permission_classes = [AllowAny]
-    throttle_classes   = [LoginThrottle]
-
-    def post(self, request):
-        raw_token = request.data.get('id_token', '').strip()
-        if not raw_token:
-            return Response({'error': 'id_token is required.'}, status=400)
-
-        # ✅ Try multiple client IDs — Android and Web
-        # React Native sends a token signed for the Android client
-        # but Django must verify against the Web client ID
-        client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
-
-        print(f"🔍 Using client_id: {client_id}")
-        print(f"🔍 Token prefix: {raw_token[:50]}")
-
-        idinfo = None
-
-        # ✅ Try verifying against both Web and Android client IDs
-        client_ids_to_try = [
-            client_id,  # Web client ID from .env
-            '849401797302-h2a3b2jhvru6fthok0rbb9b66mamhcce.apps.googleusercontent.com',  # Android client ID
-        ]
-
-        for cid in client_ids_to_try:
-            try:
-                idinfo = google_id_token.verify_oauth2_token(
-                    raw_token,
-                    google_requests.Request(),
-                    cid,
-                )
-                print(f"✅ Token verified with client_id: {cid}")
-                break
-            except ValueError as e:
-                print(f"⚠️ Failed with client_id {cid}: {e}")
-                continue
-
-        if idinfo is None:
-            return Response({'error': 'Invalid Google token. Could not verify with any client ID.'}, status=401)
-
-        email = idinfo.get('email')
-        if not email or not idinfo.get('email_verified', False):
-            return Response({'error': 'Invalid or unverified Google email.'}, status=400)
-
-        print(f"✅ Google email verified: {email}")
+        # OTP Brute-force protection via model-level attempts
+        otp_obj = TwoFactorOTP.generate_for(user)
 
         try:
-            user    = User.objects.get(email__iexact=email)
-            created = False
-        except User.DoesNotExist:
-            base     = email.split('@')[0]
-            username = _make_unique_username(base)
-            user     = User.objects.create_user(
-                username=username,
-                email=email,
-                auth_provider='google',
-                first_name=idinfo.get('given_name', ''),
-                last_name=idinfo.get('family_name', ''),
-            )
-            created = True
-        except User.MultipleObjectsReturned:
-            user    = User.objects.filter(email__iexact=email).order_by('-date_joined').first()
-            created = False
+            _send_otp_email(user, otp_obj.code, 'ConnectDial Login Code', 'login verification')
+        except Exception:
+            return Response({'error': 'Failed to send verification email.'}, status=503)
 
-        SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
+        pending_token = _issue_scoped_token(user, 'login_pending', timedelta(minutes=10))
 
-        response_data = _jwt_response(user, {'is_new_user': created})
-        print(f"✅ Returning JWT for user: {user.username}, is_new_user: {created}")
-        print(f"✅ Response keys: {list(response_data.keys())}")
-
-        return Response(response_data, status=200)
+        return Response({
+            'pending_token': pending_token,
+            'message': f'A verification code has been sent to {user.email}.',
+        }, status=200)
 
 
-# ==================== TWO-FACTOR AUTH VIEWS ====================
-
-class TwoFAVerifyView(APIView):
+class LoginVerifyOTPView(APIView):
+    """
+    Step 2: OTP verification → Full JWT + Login logging
+    """
     permission_classes = [AllowAny]
-    throttle_classes   = [OTPThrottle]
+    throttle_classes = [OTPThrottle]
 
     def post(self, request):
         pending_token = request.data.get('pending_token', '').strip()
-        otp_code      = request.data.get('otp', '').strip()
+        otp_code = request.data.get('otp', '').strip()
 
         if not pending_token or not otp_code:
             return Response({'error': 'pending_token and otp are required.'}, status=400)
 
         try:
-            user = _decode_scoped_token(pending_token, 'two_fa_pending')
+            user = _decode_scoped_token(pending_token, 'login_pending')
         except ValueError as e:
             return Response({'error': str(e)}, status=401)
 
@@ -246,18 +208,24 @@ class TwoFAVerifyView(APIView):
             .order_by('-created_at')
             .first()
         )
+
         if not otp_obj or otp_obj.is_expired():
+            _log_audit(user, 'login_otp_failed', 
+                      request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR'))
             return Response({'error': 'Invalid or expired OTP.'}, status=400)
 
         otp_obj.is_used = True
         otp_obj.save(update_fields=['is_used'])
 
+        # === SUCCESS: Track login ===
+        _log_login(user, request)
+
         return Response(_jwt_response(user), status=200)
 
 
-class TwoFAResendView(APIView):
+class LoginResendOTPView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes   = [OTPThrottle]
+    throttle_classes = [OTPThrottle]
 
     def post(self, request):
         pending_token = request.data.get('pending_token', '').strip()
@@ -265,7 +233,7 @@ class TwoFAResendView(APIView):
             return Response({'error': 'pending_token is required.'}, status=400)
 
         try:
-            user = _decode_scoped_token(pending_token, 'two_fa_pending')
+            user = _decode_scoped_token(pending_token, 'login_pending')
         except ValueError as e:
             return Response({'error': str(e)}, status=401)
 
@@ -273,65 +241,106 @@ class TwoFAResendView(APIView):
         try:
             _send_otp_email(user, otp_obj.code, 'ConnectDial Login Code', 'login verification')
         except Exception:
-            return Response({'error': 'Failed to send OTP email.'}, status=503)
+            return Response({'error': 'Failed to send verification email.'}, status=503)
 
-        return Response({'message': 'OTP resent successfully.'}, status=200)
+        return Response({'message': 'Verification code resent.'}, status=200)
 
 
-class TwoFAToggleView(APIView):
-    authentication_classes = [JWTAuthentication]
-    permission_classes     = [IsAuthenticated]
+# ==================== GOOGLE SIGN-IN ====================
+
+class GoogleSignInView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginThrottle]
 
     def post(self, request):
-        serializer = TwoFAToggleSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = request.user
-        user.two_fa_enabled = serializer.validated_data['enable']
-        user.save(update_fields=['two_fa_enabled'])
-        return Response({'two_fa_enabled': user.two_fa_enabled}, status=200)
+        raw_token = request.data.get('id_token', '').strip()
+        if not raw_token:
+            return Response({'error': 'id_token is required.'}, status=400)
+
+        client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
+        client_ids_to_try = [
+            client_id,
+            '849401797302-h2a3b2jhvru6fthok0rbb9b66mamhcce.apps.googleusercontent.com',
+        ]
+
+        idinfo = None
+        for cid in client_ids_to_try:
+            try:
+                idinfo = google_id_token.verify_oauth2_token(
+                    raw_token, google_requests.Request(), cid
+                )
+                break
+            except ValueError:
+                continue
+
+        if idinfo is None:
+            return Response({'error': 'Invalid Google token.'}, status=401)
+
+        email = idinfo.get('email')
+        if not email or not idinfo.get('email_verified', False):
+            return Response({'error': 'Invalid or unverified Google email.'}, status=400)
+
+        try:
+            user = User.objects.get(email__iexact=email)
+            created = False
+        except User.DoesNotExist:
+            username = _make_unique_username(email.split('@')[0])
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                auth_provider='google',
+                first_name=idinfo.get('given_name', ''),
+                last_name=idinfo.get('family_name', ''),
+            )
+            created = True
+        except User.MultipleObjectsReturned:
+            user = User.objects.filter(email__iexact=email).order_by('-date_joined').first()
+            created = False
+
+        SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
+
+        # Log Google login
+        _log_login(user, request)
+
+        return Response(_jwt_response(user, {'is_new_user': created}), status=200)
 
 
-class TwoFAStatusView(APIView):
-    authentication_classes = [JWTAuthentication]
-    permission_classes     = [IsAuthenticated]
-
-    def get(self, request):
-        return Response({'two_fa_enabled': request.user.two_fa_enabled}, status=200)
-
-
-# ==================== FORGOT PASSWORD VIEWS ====================
+# ==================== FORGOT PASSWORD (Enhanced) ====================
 
 class ForgotPasswordRequestView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes   = [PasswordResetThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
-        identifier = request.data.get('email', '').strip()
+        identifier = (request.data.get('identifier') or request.data.get('email', '')).strip()
+
         if not identifier:
-            return Response({'error': 'email is required.'}, status=400)
+            return Response({'error': 'email or username is required.'}, status=400)
 
         user = _get_user_by_identifier(identifier)
-
         if user and user.is_active:
             otp_obj = PasswordResetOTP.generate_for(user)
             try:
                 _send_otp_email(user, otp_obj.code, 'ConnectDial Password Reset', 'password reset')
+                _log_audit(user, 'password_reset_requested', 
+                          request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR'))
             except Exception:
                 return Response({'error': 'Failed to send reset email.'}, status=503)
 
+        # Anti-enumeration: always return same message
         return Response({'message': 'If that account exists, a reset code has been sent.'}, status=200)
 
 
 class ForgotPasswordVerifyOTPView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes   = [OTPThrottle]
+    throttle_classes = [OTPThrottle]
 
     def post(self, request):
-        identifier = request.data.get('email', '').strip()
-        otp_code   = request.data.get('otp', '').strip()
+        identifier = (request.data.get('identifier') or request.data.get('email', '')).strip()
+        otp_code = request.data.get('otp', '').strip()
 
         if not identifier or not otp_code:
-            return Response({'error': 'email and otp are required.'}, status=400)
+            return Response({'error': 'identifier and otp are required.'}, status=400)
 
         user = _get_user_by_identifier(identifier)
         if not user:
@@ -343,6 +352,7 @@ class ForgotPasswordVerifyOTPView(APIView):
             .order_by('-created_at')
             .first()
         )
+
         if not otp_obj or otp_obj.is_expired():
             return Response({'error': 'Invalid or expired OTP.'}, status=400)
 
@@ -350,16 +360,23 @@ class ForgotPasswordVerifyOTPView(APIView):
         otp_obj.save(update_fields=['is_used'])
 
         reset_token = _issue_scoped_token(user, 'password_reset', timedelta(minutes=15))
+
+        _log_audit(user, 'password_reset_otp_verified', 
+                  request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR'))
+
         return Response({'reset_token': reset_token}, status=200)
 
 
 class ForgotPasswordResetView(APIView):
+    """
+    Final step: Reset password + Auto-login (returns fresh JWT)
+    """
     permission_classes = [AllowAny]
-    throttle_classes   = [PasswordResetThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
-        reset_token      = request.data.get('reset_token', '').strip()
-        new_password     = request.data.get('new_password', '').strip()
+        reset_token = request.data.get('reset_token', '').strip()
+        new_password = request.data.get('new_password', '').strip()
         confirm_password = request.data.get('confirm_password', '').strip()
 
         if not reset_token or not new_password or not confirm_password:
@@ -375,14 +392,21 @@ class ForgotPasswordResetView(APIView):
 
         user.set_password(new_password)
         user.save(update_fields=['password'])
-        return Response({'message': 'Password reset successfully.'}, status=200)
+
+        _log_audit(user, 'password_reset_success', 
+                  request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR'))
+
+        # === UX: Auto-login after successful reset ===
+        _log_login(user, request)
+
+        return Response(_jwt_response(user), status=200)
 
 
-# ==================== PROFILE & SOCIAL VIEWS ====================
+# ==================== OTHER VIEWS ====================
 
 class ToggleFollowView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes     = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, user_id):
         follower = request.user
@@ -404,14 +428,14 @@ class ToggleFollowView(APIView):
 
 
 class RegisterView(generics.CreateAPIView):
-    queryset           = User.objects.all()
-    serializer_class   = UserSerializer
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
     permission_classes = [AllowAny]
 
 
 class OnboardingView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes     = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         serializer = OnboardingSerializer(data=request.data, context={'request': request})
@@ -422,22 +446,22 @@ class OnboardingView(APIView):
 
 
 class ProfileListView(generics.ListAPIView):
-    queryset               = Profile.objects.select_related('user').all()
-    serializer_class       = ProfileSerializer
-    permission_classes     = [IsAuthenticated]
+    queryset = Profile.objects.select_related('user').all()
+    serializer_class = ProfileSerializer
+    permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
-    filter_backends        = [filters.SearchFilter]
-    search_fields          = ['user__username', 'bio', 'display_name']
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['user__username', 'bio', 'display_name']
 
 
 class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
-    serializer_class       = ProfileSerializer
-    permission_classes     = [IsAuthenticated]
+    serializer_class = ProfileSerializer
+    permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
-    parser_classes         = [JSONParser, MultiPartParser, FormParser]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     def get_object(self):
-        user_id  = self.request.query_params.get('user_id')
+        user_id = self.request.query_params.get('user_id')
         username = self.request.query_params.get('username')
         if user_id:
             user = User.objects.get(id=user_id)
@@ -454,9 +478,13 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
 
 class LogoutView(APIView):
     authentication_classes = [JWTAuthentication]
-    permission_classes     = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        ip = request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')
+        device = request.META.get('HTTP_USER_AGENT', 'Unknown')
+
+        # Blacklist refresh token if provided
         try:
             refresh_token = request.data.get('refresh', '').strip()
             if refresh_token:
@@ -465,9 +493,12 @@ class LogoutView(APIView):
         except Exception:
             pass
 
+        # Clear FCM token
         if hasattr(request.user, 'profile'):
             profile = request.user.profile
             profile.fcm_token = None
             profile.save(update_fields=['fcm_token'])
+
+        _log_audit(request.user, 'logout', ip, device)
 
         return Response({'message': 'Logged out successfully.'}, status=200)

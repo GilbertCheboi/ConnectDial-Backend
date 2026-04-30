@@ -40,15 +40,43 @@ class UserSerializer(serializers.ModelSerializer):
             'favorite_league',
             'fan_preferences',
             'is_onboarded',
-            'two_fa_enabled',
             'is_pioneer',
-            #'is_bot',
         ]
 
     def get_is_onboarded(self, obj):
         if obj.account_type in ['news', 'organization']:
             return True
         return FanPreference.objects.filter(user=obj).exists()
+
+
+# ========================= CUSTOM LOGIN =========================
+
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+class CustomLoginSerializer(TokenObtainPairSerializer):
+    # Swap out the default 'username' field for 'identifier' (username OR email)
+    username   = None
+    identifier = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        identifier = attrs.pop('identifier', '').strip()
+
+        # Resolve identifier → actual username for the parent serializer
+        if '@' in identifier:
+            qs = User.objects.filter(email__iexact=identifier)
+        else:
+            qs = User.objects.filter(username__iexact=identifier)
+
+        if not qs.exists():
+            raise serializers.ValidationError('No account found with that username or email.')
+
+        user = qs.order_by('-date_joined').first()
+
+        # Inject the real username so TokenObtainPairSerializer can verify the password
+        attrs[self.username_field] = user.username
+
+        # Parent handles password check, inactive user, and updates last_login
+        return super().validate(attrs)
 
 
 # ========================= ONBOARDING =========================
@@ -78,7 +106,6 @@ class OnboardingSerializer(serializers.ModelSerializer):
                     f"{account_type.title()} accounts must select at least one league."
                 )
 
-        # Check for duplicate leagues
         if preferences:
             leagues = [
                 fp['league'].id if isinstance(fp['league'], League) else fp['league']
@@ -90,13 +117,11 @@ class OnboardingSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        user          = self.context['request'].user
-        account_type  = validated_data.get('account_type', user.account_type)
+        user           = self.context['request'].user
+        account_type   = validated_data.get('account_type', user.account_type)
         fan_prefs_data = validated_data.get('fan_preferences', [])
 
         user.account_type = account_type
-
-        # Clear old preferences
         FanPreference.objects.filter(user=user).delete()
 
         if account_type == 'fan':
@@ -109,8 +134,7 @@ class OnboardingSerializer(serializers.ModelSerializer):
                 user.favorite_team   = primary['team']
                 user.favorite_league = primary['league']
                 user.fan_badge       = f"{primary['team'].name} Fan"
-
-        else:  # news or organization
+        else:
             for fp in fan_prefs_data:
                 FanPreference.objects.create(user=user, league=fp['league'], team=fp.get('team'))
             if account_type == 'news':
@@ -162,22 +186,3 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     def get_following_count(self, obj):
         return obj.user.following.count()
-
-
-# ========================= 2FA =========================
-
-class TwoFAToggleSerializer(serializers.Serializer):
-    enable = serializers.BooleanField()
-
-
-# ========================= CUSTOM LOGIN SERIALIZER =========================
-
-from dj_rest_auth.serializers import LoginSerializer
-
-class CustomLoginSerializer(LoginSerializer):
-    """
-    Extends dj-rest-auth's LoginSerializer.
-    The user payload shape is controlled via REST_AUTH['USER_DETAILS_SERIALIZER']
-    pointing to UserSerializer — no overrides needed here.
-    """
-    pass

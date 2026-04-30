@@ -1,26 +1,18 @@
-from django.urls import path, include
-
+from django.urls import path
 from .views import (
     # Auth
     CustomLoginView,
+    LoginVerifyOTPView,
+    LoginResendOTPView,
     RegisterView,
     OnboardingView,
     LogoutView,
-
     # Google
     GoogleSignInView,
-
-    # 2FA
-    TwoFAVerifyView,
-    TwoFAResendView,
-    TwoFAToggleView,
-    TwoFAStatusView,
-
     # Forgot Password
     ForgotPasswordRequestView,
     ForgotPasswordVerifyOTPView,
     ForgotPasswordResetView,
-
     # Profile & Social
     UserProfileUpdateView,
     ProfileListView,
@@ -28,20 +20,16 @@ from .views import (
 )
 
 urlpatterns = [
-    
+
     # ── Core auth ────────────────────────────────────────────────
-    path('login/',         CustomLoginView.as_view(),  name='rest_login'),
-    path('register/',      RegisterView.as_view(),      name='register'),
-    path('logout-custom/', LogoutView.as_view(),        name='logout-custom'),
+    path('login/',          CustomLoginView.as_view(),     name='login'),
+    path('login/verify/',   LoginVerifyOTPView.as_view(),  name='login-verify-otp'),
+    path('login/resend/',   LoginResendOTPView.as_view(),  name='login-resend-otp'),
+    path('register/',       RegisterView.as_view(),        name='register'),
+    path('logout-custom/',  LogoutView.as_view(),          name='logout-custom'),
 
     # ── Google Sign-In ────────────────────────────────────────────
-    path('social/google/', GoogleSignInView.as_view(), name='google-signin'),
-
-    # ── Two-Factor Auth ───────────────────────────────────────────
-    path('2fa/verify/',  TwoFAVerifyView.as_view(),  name='2fa-verify'),
-    path('2fa/resend/',  TwoFAResendView.as_view(),  name='2fa-resend'),
-    path('2fa/toggle/',  TwoFAToggleView.as_view(),  name='2fa-toggle'),
-    path('2fa/status/',  TwoFAStatusView.as_view(),  name='2fa-status'),
+    path('social/google/',  GoogleSignInView.as_view(),    name='google-signin'),
 
     # ── Forgot Password ───────────────────────────────────────────
     path('forgot-password/request/', ForgotPasswordRequestView.as_view(),   name='forgot-password-request'),
