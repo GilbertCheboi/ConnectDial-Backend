@@ -10,10 +10,10 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security & Core
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
+SECRET_KEY = os.environ.get('SECRET_KEY')
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['192.168.100.107', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4']
+ALLOWED_HOSTS = ['192.168.100.107', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4', '192.168.100.40']
 AUTH_USER_MODEL = 'users.User'
 SITE_ID = 1
 
@@ -85,14 +85,12 @@ WSGI_APPLICATION = 'connectdial.wsgi.application'
 
 # settings.py
 
+# settings.py
+
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'connectdial_db',
-        'USER': 'gilly',
-        'PASSWORD': 'Iam1@Nitronitro',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',   # This creates the database file in your project root
     }
 }
 
