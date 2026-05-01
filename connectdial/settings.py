@@ -3,21 +3,31 @@ from pathlib import Path
 from datetime import timedelta
 from google.oauth2 import service_account
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Security & Core
+# ======================
+# SECURITY & CORE
+# ======================
 SECRET_KEY = os.environ.get('SECRET_KEY')
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['192.168.100.107', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4', '192.168.100.40']
+ALLOWED_HOSTS = [
+    '192.168.100.107', 'localhost', '127.0.0.1',
+    '10.126.232.156', '192.168.100.4', '10.199.198.201','10.199.198.22'
+]
+
 AUTH_USER_MODEL = 'users.User'
 SITE_ID = 1
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Application definition
+# ======================
+# APPLICATION DEFINITION
+# ======================
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -26,10 +36,11 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django.contrib.sites',
-    
+
     # Third Party
     'rest_framework',
     'rest_framework.authtoken',
+    'drf_spectacular',
     'dj_rest_auth',
     'dj_rest_auth.registration',
     'allauth',
@@ -63,9 +74,22 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True
 ROOT_URLCONF = 'connectdial.urls'
+WSGI_APPLICATION = 'connectdial.wsgi.application'
 
+# ======================
+# DATABASE
+# ======================
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+
+# ======================
+# TEMPLATES
+# ======================
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
@@ -81,21 +105,11 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'connectdial.wsgi.application'
-
-# settings.py
-
-# settings.py
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',   # This creates the database file in your project root
-    }
-}
-
-# Static & Media
+# ======================
+# STATIC & MEDIA (Google Cloud Storage)
+# ======================
 STATIC_URL = 'static/'
+
 GS_BUCKET_NAME = 'connectdial-bb223.firebasestorage.app'
 GS_KEY_PATH = os.path.join(BASE_DIR, 'firebase-service-account.json')
 
@@ -110,51 +124,117 @@ else:
     MEDIA_URL = '/media/'
     MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-# Authentication & REST
+# Google Cloud Storage tweaks
+GS_DEFAULT_TIMEOUT = 300
+GS_CONNECTION_TIMEOUT = 300
+GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB
+
+# ======================
+# CORS (⚠️ Change before production!)
+# ======================
+CORS_ALLOW_ALL_ORIGINS = True   # ← Security risk in production
+
+# ======================
+# AUTHENTICATION
+# ======================
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',
 )
 
+# Allauth settings
+ACCOUNT_EMAIL_VERIFICATION = 'none'
+ACCOUNT_AUTHENTICATION_METHOD = 'email'
+ACCOUNT_EMAIL_REQUIRED = True
+ACCOUNT_UNIQUE_EMAIL = True
+SOCIALACCOUNT_AUTO_SIGNUP = True
+SOCIALACCOUNT_LOGIN_ON_GET = True
+
+SOCIALACCOUNT_PROVIDERS = {
+    'google': {
+        'APP': {
+            'client_id': os.getenv('GOOGLE_CLIENT_ID'),
+            'secret': os.getenv('GOOGLE_CLIENT_SECRET'),
+            'key': '',
+        },
+        'SCOPE': ['profile', 'email'],
+        'AUTH_PARAMS': {'access_type': 'online'},
+        'FETCH_USERINFO': True,
+    }
+}
+
+# ======================
+# REST FRAMEWORK + SPECTACULAR
+# ======================
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework.authentication.TokenAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',   # ← Fixed
     'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
+
+    'DEFAULT_THROTTLE_RATES': {
+        'login': '10/min',
+        'otp': '5/min',
+        'password_reset': '5/min',
+    },
 }
 
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'ConnectDial API',
+    'DESCRIPTION': 'ConnectDial Backend API Documentation',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'COMPONENT_SPLIT_PATCH': True,
+
+    # 'SWAGGER_UI_DIST': 'SIDECAR',   # Uncomment if using drf-spectacular-sidecar
+    # 'REDOC_DIST': 'SIDECAR',
+}
+
+# ======================
+# SIMPLE JWT
+# ======================
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-# Celery Configuration
+# ======================
+# EMAIL (Gmail SMTP)
+# ======================
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@connectdial.com')
+
+# ======================
+# CELERY
+# ======================
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
 CELERY_TIMEZONE = 'UTC'
 
-# connectdial/settings.py
-from celery.schedules import crontab
-
 CELERY_BEAT_SCHEDULE = {
-    # --- 1. CORE SOCIAL & ENGAGEMENT TASKS ---
-    # These stay frequent as they mostly use your internal database
-    'trigger-bot-engagement-every-30m': {
+    # Core tasks
+    'trigger-bot-engagement-every-12h': {
         'task': 'posts.tasks.coordinate_bot_engagement',
-        'schedule': crontab(hour='*/12'),  # Every 12 hours
+        'schedule': crontab(hour='*/12'),
     },
-    'bot-social-expansion-hourly': {
+    'bot-social-expansion': {
         'task': 'posts.tasks.expand_bot_social_graph',
-        'schedule': crontab(hour='*/8'), #
+        'schedule': crontab(hour='*/8'),
         'args': (15,),
     },
 
-    # --- 2. TEXT/IMAGE NEWS SYNC (Staggered every 4 Hours) ---
-    # We use different minutes (0, 5, 10, 15...) to avoid hitting the AI API at once
+    # Sports news sync (staggered)
     'sync-premier-league': {
         'task': 'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=0, hour='*/4'),
@@ -190,9 +270,8 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=30, hour='*/4'),
         'args': ('Kenya Premier League', 3),
     },
-                                        
-    # --- 3. YOUTUBE SHORTS CONTENT (Staggered every 8-12 Hours) ---
-    # Visual content is expensive for quotas; we've moved these to 2-3 times daily.
+
+    # YouTube Shorts (staggered)
     'post-premier-league-shorts': {
         'task': 'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=30, hour='*/8'),
@@ -224,7 +303,7 @@ CELERY_BEAT_SCHEDULE = {
         'args': ('Kenya Premier League',),
     },
 
-    # Low Priority / International (Every 12 Hours)
+    # Lower priority leagues (every 12h)
     'post-la-liga-shorts': {
         'task': 'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=0, hour='*/12'),
@@ -245,8 +324,6 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': crontab(minute=15, hour='*/12'),
         'args': ('Ligue 1',),
     },
-
-    # US Secondary & Special (Every 12 Hours)
     'post-mlb-shorts': {
         'task': 'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=20, hour='*/12'),
@@ -264,14 +341,16 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
-# External API Keys (Loaded from .env)
+# ======================
+# EXTERNAL API KEYS
+# ======================
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 NEWS_API_KEY = os.getenv('NEWS_API_KEY')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
-# Give it 300 seconds (5 minutes) instead of the default 120
-GS_DEFAULT_TIMEOUT = 300  
-GS_CONNECTION_TIMEOUT = 300
-
-# Optional: Disable the retry mechanism if it's causing loops
-GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB chunks (helps with stability)
+# ======================
+# OTP SETTINGS
+# ======================
+OTP_EXPIRY_SECONDS = 300
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN = 30

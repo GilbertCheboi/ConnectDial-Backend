@@ -169,3 +169,4 @@ class CustomLoginSerializer(LoginSerializer):
     # to pack the user data into the JSON response."
     def get_response_serializer(self):
         return UserSerializer
+    
