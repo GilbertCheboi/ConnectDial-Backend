@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from .models import User, FanPreference, Profile
 from leagues.models import League, Team
-from .models import Follow  # Ensure you have a Follow model for the following logic
+from .models import Follow
+from django.contrib.auth import authenticate
 
 
 class FanPreferenceSerializer(serializers.ModelSerializer):
@@ -38,7 +39,6 @@ class UserSerializer(serializers.ModelSerializer):
     def get_is_onboarded(self, obj):
         if obj.account_type in ['news', 'organization']:
             return True
-
         return FanPreference.objects.filter(user=obj).exists()
 
 
@@ -59,7 +59,6 @@ class OnboardingSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     "Fan accounts must select at least one favorite team."
                 )
-            # Validate that fan accounts have teams
             for fp in preferences:
                 if not fp.get('team'):
                     raise serializers.ValidationError(
@@ -71,8 +70,6 @@ class OnboardingSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     f"{account_type.title()} accounts must select at least one league."
                 )
-            # For news/org, team is optional
-            pass
 
         if preferences:
             leagues = [
@@ -100,7 +97,7 @@ class OnboardingSerializer(serializers.ModelSerializer):
                 FanPreference.objects.create(
                     user=user,
                     league=fp['league'],
-                    team=fp['team']
+                    team=fp['team'],
                 )
 
             if fan_preferences_data:
@@ -110,18 +107,17 @@ class OnboardingSerializer(serializers.ModelSerializer):
                 user.fan_badge = f"{primary_pref['team'].name} Fan"
 
         else:
-            # For news/organization accounts, create fan_preferences with leagues but no teams
             FanPreference.objects.filter(user=user).delete()
             user.favorite_team = None
             user.favorite_league = None
-            
+
             for fp in fan_preferences_data:
                 FanPreference.objects.create(
                     user=user,
                     league=fp['league'],
-                    team=fp.get('team')  # Allow team to be None
+                    team=fp.get('team'),
                 )
-            
+
             if account_type == 'news' and user.badge_type == 'official':
                 user.fan_badge = 'Official Media'
             elif account_type == 'news':
@@ -135,23 +131,25 @@ class OnboardingSerializer(serializers.ModelSerializer):
 
 
 class ProfileSerializer(serializers.ModelSerializer):
-    # 🚀 Add these lines to pull data from the related User model
-    username = serializers.ReadOnlyField(source='user.username')
+    username        = serializers.ReadOnlyField(source='user.username')
     fan_preferences = FanPreferenceSerializer(source='user.fan_preferences', many=True, read_only=True)
-    is_following = serializers.SerializerMethodField()
+    is_following    = serializers.SerializerMethodField()
     followers_count = serializers.SerializerMethodField()
     following_count = serializers.SerializerMethodField()
-    user_id = serializers.ReadOnlyField(source='user.id')
-    # Remove the SerializerMethodField for profile_image to allow file uploads
+    user_id         = serializers.ReadOnlyField(source='user.id')
+
     class Meta:
-        model = Profile
-        # 🚀 Add 'username' and 'fan_preferences' to the fields
-        fields = ['id', 'user_id', 'display_name', 'bio', 'profile_image', 'banner_image', 'fcm_token', 'username', 'fan_preferences', 'is_following', 'followers_count', 'following_count']
+        model  = Profile
+        fields = [
+            'id', 'user_id', 'display_name', 'bio',
+            'profile_image', 'banner_image', 'fcm_token',
+            'username', 'fan_preferences',
+            'is_following', 'followers_count', 'following_count',
+        ]
 
     def get_is_following(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
-            # Check if the logged-in user follows the owner of THIS profile
             return Follow.objects.filter(follower=request.user, followed=obj.user).exists()
         return False
 
@@ -161,12 +159,71 @@ class ProfileSerializer(serializers.ModelSerializer):
     def get_following_count(self, obj):
         return obj.user.following.count()
 
+
+# ─────────────────────────────────────────────
+# CUSTOM LOGIN SERIALIZER
+# ─────────────────────────────────────────────
+
 from dj_rest_auth.serializers import LoginSerializer
 
 class CustomLoginSerializer(LoginSerializer):
-    # This is the "Delivery Man" method. 
-    # It tells Django: "When the login is successful, use UserSerializer 
-    # to pack the user data into the JSON response."
-    def get_response_serializer(self):
-        return UserSerializer
-    
+    # Accept username OR email so the frontend can send either.
+    # dj-rest-auth's default enforces email+password — we override that here.
+    username = serializers.CharField(required=False, allow_blank=True)
+    email    = serializers.EmailField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        username = attrs.get('username', '').strip()
+        email    = attrs.get('email', '').strip()
+        password = attrs.get('password', '')
+
+        if not password:
+            raise serializers.ValidationError(
+                {'password': 'Password is required.'},
+                code='authorization',
+            )
+
+        # Resolve identifier: prefer username, fall back to email
+        identifier = username or email
+
+        if not identifier:
+            raise serializers.ValidationError(
+                {'username': 'Username or email is required.'},
+                code='authorization',
+            )
+
+        # If identifier looks like an email, try email-based auth first
+        user = None
+        if '@' in identifier:
+            try:
+                matched = User.objects.get(email__iexact=identifier)
+                user = authenticate(
+                    request=self.context.get('request'),
+                    username=matched.username,
+                    password=password,
+                )
+            except User.DoesNotExist:
+                pass
+
+        # Fall back to direct username auth
+        if user is None:
+            user = authenticate(
+                request=self.context.get('request'),
+                username=identifier,
+                password=password,
+            )
+
+        if user is None:
+            raise serializers.ValidationError(
+                {'non_field_errors': ['Invalid username/email or password.']},
+                code='authorization',
+            )
+
+        if not user.is_active:
+            raise serializers.ValidationError(
+                {'non_field_errors': ['This account has been disabled.']},
+                code='authorization',
+            )
+
+        attrs['user'] = user
+        return attrs
