@@ -164,15 +164,12 @@ SOCIALACCOUNT_PROVIDERS = {
 }
 
 # ======================
-# REST FRAMEWORK + SPECTACULAR
-# ======================
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.TokenAuthentication',
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',   # ← Fixed
     'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
 
@@ -181,6 +178,18 @@ REST_FRAMEWORK = {
         'otp': '5/min',
         'password_reset': '5/min',
     },
+}
+
+# ======================
+# SIMPLE JWT (Improved)
+# ======================
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,           # ← Recommended
+    'BLACKLIST_AFTER_ROTATION': True,        # ← Recommended
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
 }
 
 SPECTACULAR_SETTINGS = {
@@ -195,14 +204,7 @@ SPECTACULAR_SETTINGS = {
     # 'REDOC_DIST': 'SIDECAR',
 }
 
-# ======================
-# SIMPLE JWT
-# ======================
-SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
-    'AUTH_HEADER_TYPES': ('Bearer',),
-}
+
 
 # ======================
 # EMAIL (Gmail SMTP)

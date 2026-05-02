@@ -1,4 +1,6 @@
 from django.urls import path, include
+from rest_framework_simplejwt.views import TokenRefreshView
+
 from .views import (
     # Auth
     CustomLoginView,
@@ -69,6 +71,7 @@ urlpatterns = [
 
     # ── Token check ───────────────────────────────────────────
     path('token/check/', CheckTokenView.as_view(), name='token-check'),
+    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
     # ── Social ────────────────────────────────────────────────
     path('users/<int:user_id>/toggle-follow/', ToggleFollowView.as_view(), name='toggle-follow'),

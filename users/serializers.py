@@ -41,41 +41,41 @@ class UserSerializer(serializers.ModelSerializer):
             return True
         return FanPreference.objects.filter(user=obj).exists()
 
-
 class OnboardingSerializer(serializers.ModelSerializer):
     account_type = serializers.ChoiceField(choices=User.ACCOUNT_TYPES)
     fan_preferences = FanPreferenceSerializer(many=True, required=False)
+    append_mode = serializers.BooleanField(default=False, required=False)   # ← NEW
 
     class Meta:
         model = User
-        fields = ['account_type', 'fan_preferences']
+        fields = ['account_type', 'fan_preferences', 'append_mode']
 
     def validate(self, data):
         account_type = data.get('account_type')
         preferences = data.get('fan_preferences', [])
+        append_mode = data.get('append_mode', False)
 
         if account_type == 'fan':
-            if not preferences:
+            if not preferences and not append_mode:
                 raise serializers.ValidationError(
                     "Fan accounts must select at least one favorite team."
                 )
             for fp in preferences:
                 if not fp.get('team'):
                     raise serializers.ValidationError(
-                        "Fan accounts must select a team for each league."
+                        "Each league must have a selected team for fan accounts."
                     )
 
-        if account_type in ['news', 'organization']:
-            if not preferences:
+        # For news/organization accounts
+        elif account_type in ['news', 'organization']:
+            if not preferences and not append_mode:
                 raise serializers.ValidationError(
                     f"{account_type.title()} accounts must select at least one league."
                 )
 
+        # Check for duplicate leagues
         if preferences:
-            leagues = [
-                fp['league'].id if isinstance(fp['league'], League) else fp['league']
-                for fp in preferences
-            ]
+            leagues = [fp['league'] for fp in preferences if fp.get('league')]
             if len(leagues) != len(set(leagues)):
                 raise serializers.ValidationError("You can only select one team per league.")
 
@@ -84,49 +84,51 @@ class OnboardingSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         user = self.context['request'].user
         account_type = validated_data.get('account_type', user.account_type)
-        fan_preferences_data = validated_data.get('fan_preferences', [])
+        preferences_data = validated_data.get('fan_preferences', [])
+        append_mode = validated_data.get('append_mode', False)
 
         user.account_type = account_type
 
-        if account_type == 'fan':
-            user.favorite_team = None
-            user.favorite_league = None
-            FanPreference.objects.filter(user=user).delete()
-
-            for fp in fan_preferences_data:
-                FanPreference.objects.create(
-                    user=user,
-                    league=fp['league'],
-                    team=fp['team'],
-                )
-
-            if fan_preferences_data:
-                primary_pref = fan_preferences_data[0]
-                user.favorite_team = primary_pref['team']
-                user.favorite_league = primary_pref['league']
-                user.fan_badge = f"{primary_pref['team'].name} Fan"
-
+        # Handle append_mode (for editing preferences)
+        if append_mode:
+            # Only add new preferences, don't delete existing ones
+            existing_leagues = set(FanPreference.objects.filter(user=user).values_list('league_id', flat=True))
+            for fp in preferences_data:
+                if fp['league'].id not in existing_leagues:
+                    FanPreference.objects.create(
+                        user=user,
+                        league=fp['league'],
+                        team=fp.get('team')
+                    )
         else:
+            # Full replace (first time onboarding)
             FanPreference.objects.filter(user=user).delete()
             user.favorite_team = None
             user.favorite_league = None
 
-            for fp in fan_preferences_data:
+            for fp in preferences_data:
                 FanPreference.objects.create(
                     user=user,
                     league=fp['league'],
-                    team=fp.get('team'),
+                    team=fp.get('team')
                 )
 
-            if account_type == 'news' and user.badge_type == 'official':
-                user.fan_badge = 'Official Media'
-            elif account_type == 'news':
-                user.fan_badge = 'Awaiting Partnership'
+            # Set primary team/league for fans
+            if account_type == 'fan' and preferences_data:
+                primary = preferences_data[0]
+                user.favorite_team = primary.get('team')
+                user.favorite_league = primary.get('league')
+                user.fan_badge = f"{primary['team'].name} Fan" if primary.get('team') else None
+
+        # Special badge logic for news/org
+        if account_type == 'news':
+            user.fan_badge = 'Official Media' if user.badge_type == 'official' else 'Awaiting Partnership'
 
         user.save()
         return user
 
     def update(self, instance, validated_data):
+        """Handle both create and update the same way"""
         return self.create(validated_data)
 
 

@@ -51,7 +51,7 @@ class CustomUserAdmin(BaseUserAdmin):
         ('ConnectDial Info', {
             'fields': (
                 'account_type', 'badge_type', 'auth_provider',
-                'favorite_team', 'favorite_league', 'fan_badge', 'two_fa_enabled'
+                'favorite_team', 'favorite_league', 'fan_badge'
             )
         }),
         ('Permissions', {
