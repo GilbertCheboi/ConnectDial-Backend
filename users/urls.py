@@ -1,58 +1,89 @@
 from django.urls import path, include
+from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (
     # Auth
     CustomLoginView,
-    RegisterView,
-    OnboardingView,
     LogoutView,
-
-    # Google
     GoogleSignInView,
 
+    # OTP
+    SendOTPView,
+    VerifyOTPView,
+
+    # Password
+    ForgotPasswordView,
+    ResetPasswordView,
+    ChangePasswordView,
+
+    # Email verification
+    SendEmailVerificationView,
+    VerifyEmailView,
+
     # 2FA
-    TwoFAVerifyView,
-    TwoFAResendView,
-    TwoFAToggleView,
-    TwoFAStatusView,
+    Setup2FAView,
+    Verify2FASetupView,
+    Validate2FAView,
+    Disable2FAView,
+    Get2FAStatusView,
 
-    # Forgot Password
-    ForgotPasswordRequestView,
-    ForgotPasswordVerifyOTPView,
-    ForgotPasswordResetView,
+    # Token
+    CheckTokenView,
 
-    # Profile & Social
+    # Social
+    ToggleFollowView,
+
+    # Profile & Onboarding
+    OnboardingView,
     UserProfileUpdateView,
     ProfileListView,
-    ToggleFollowView,
 )
 
 urlpatterns = [
+    # ── Core auth ─────────────────────────────────────────────
+    path('login/', CustomLoginView.as_view(), name='rest_login'),
 
-    # ── Core auth ────────────────────────────────────────────────
-    path('login/',         CustomLoginView.as_view(),  name='rest_login'),
-    path('register/',      RegisterView.as_view(),      name='register'),
-    path('logout-custom/', LogoutView.as_view(),        name='logout-custom'),
+    # ── Custom logout (clears FCM token) ──────────────────────
+    path('logout-custom/', LogoutView.as_view(), name='logout-custom'),
 
-    # ── Google Sign-In ────────────────────────────────────────────
-    path('social/google/', GoogleSignInView.as_view(), name='google-signin'),
+    # ── Google Sign-In (JWT) ───────────────────────────────────
+    path('social/google/', GoogleSignInView.as_view(), name='google_login'),
 
-    # ── Two-Factor Auth ───────────────────────────────────────────
-    path('2fa/verify/',  TwoFAVerifyView.as_view(),  name='2fa-verify'),
-    path('2fa/resend/',  TwoFAResendView.as_view(),  name='2fa-resend'),
-    path('2fa/toggle/',  TwoFAToggleView.as_view(),  name='2fa-toggle'),
-    path('2fa/status/',  TwoFAStatusView.as_view(),  name='2fa-status'),
+    # ── OTP ───────────────────────────────────────────────────
+    path('otp/send/', SendOTPView.as_view(), name='otp-send'),
+    path('otp/verify/', VerifyOTPView.as_view(), name='otp-verify'),
 
-    # ── Forgot Password ───────────────────────────────────────────
-    path('forgot-password/request/', ForgotPasswordRequestView.as_view(),   name='forgot-password-request'),
-    path('forgot-password/verify/',  ForgotPasswordVerifyOTPView.as_view(), name='forgot-password-verify'),
-    path('forgot-password/reset/',   ForgotPasswordResetView.as_view(),     name='forgot-password-reset'),
+    # ── Password ──────────────────────────────────────────────
+    path('password/forgot/', ForgotPasswordView.as_view(), name='password-forgot'),
+    path('password/reset/', ResetPasswordView.as_view(), name='password-reset'),
+    path('password/change/', ChangePasswordView.as_view(), name='password-change'),
 
-    # ── Onboarding & Profile ──────────────────────────────────────
-    path('onboarding/', OnboardingView.as_view(),        name='onboarding'),
-    path('update/',     UserProfileUpdateView.as_view(), name='profile-update'),
-    path('search/',     ProfileListView.as_view(),       name='profile-search'),
+    # ── Email verification ────────────────────────────────────
+    path('email/send-verification/', SendEmailVerificationView.as_view(), name='email-send-verification'),
+    path('email/verify/', VerifyEmailView.as_view(), name='email-verify'),
 
-    # ── Social ────────────────────────────────────────────────────
+    # ── 2FA ───────────────────────────────────────────────────
+    path('2fa/setup/', Setup2FAView.as_view(), name='2fa-setup'),
+    path('2fa/verify-setup/', Verify2FASetupView.as_view(), name='2fa-verify-setup'),
+    path('2fa/validate/', Validate2FAView.as_view(), name='2fa-validate'),
+    path('2fa/disable/', Disable2FAView.as_view(), name='2fa-disable'),
+    path('2fa/status/', Get2FAStatusView.as_view(), name='2fa-status'),
+
+    # ── Token check ───────────────────────────────────────────
+    path('token/check/', CheckTokenView.as_view(), name='token-check'),
+    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+
+    # ── Social ────────────────────────────────────────────────
     path('users/<int:user_id>/toggle-follow/', ToggleFollowView.as_view(), name='toggle-follow'),
+
+    # ── Profile & onboarding ──────────────────────────────────
+    path('onboarding/', OnboardingView.as_view(), name='onboarding'),
+    path('update/', UserProfileUpdateView.as_view(), name='profile-update'),
+    path('search/', ProfileListView.as_view(), name='profile-search'),
+
+    # ── dj-rest-auth & registration (fallback — must stay last) ──
+    # Kept at the bottom so dj-rest-auth's built-in password/reset/,
+    # password/change/, logout/, etc. never shadow the custom views above.
+    path('', include('dj_rest_auth.urls')),
+    path('register/', include('dj_rest_auth.registration.urls')),
 ]

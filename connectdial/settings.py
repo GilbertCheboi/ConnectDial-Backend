@@ -1,32 +1,33 @@
 import os
-from datetime import timedelta
 from pathlib import Path
-
-from dotenv import load_dotenv
+from datetime import timedelta
 from google.oauth2 import service_account
+from dotenv import load_dotenv
+from celery.schedules import crontab
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ─────────────────────────────────────────────
-# Security & Core
-# ─────────────────────────────────────────────
-
+# ======================
+# SECURITY & CORE
+# ======================
 SECRET_KEY = os.environ.get('SECRET_KEY')
-DEBUG      = os.getenv('DEBUG', 'False') == 'True'
+DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['192.168.100.107', '192.168.0.114', 'localhost', '127.0.0.1', '10.126.232.156', '192.168.100.4']
+ALLOWED_HOSTS = [
+    '192.168.100.107', 'localhost', '127.0.0.1',
+    '10.126.232.156', '192.168.100.4', '10.199.198.201','10.199.198.22'
+]
 
 AUTH_USER_MODEL = 'users.User'
-SITE_ID         = 1
+SITE_ID = 1
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-
-# ─────────────────────────────────────────────
-# Application definition
-# ─────────────────────────────────────────────
-
+# ======================
+# APPLICATION DEFINITION
+# ======================
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -38,9 +39,8 @@ INSTALLED_APPS = [
 
     # Third Party
     'rest_framework',
-    # rest_framework.authtoken removed — JWT only, no DRF token auth
-    'rest_framework_simplejwt',
-    'rest_framework_simplejwt.token_blacklist',
+    'rest_framework.authtoken',
+    'drf_spectacular',
     'dj_rest_auth',
     'dj_rest_auth.registration',
     'allauth',
@@ -51,7 +51,6 @@ INSTALLED_APPS = [
     'corsheaders',
     'django_extensions',
     'storages',
-    'drf_spectacular',
 
     # Local apps
     'users',
@@ -75,13 +74,22 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-# ─────────────────────────────────────────────
-# CORS
-# ─────────────────────────────────────────────
-
-CORS_ALLOW_ALL_ORIGINS = True
 ROOT_URLCONF = 'connectdial.urls'
+WSGI_APPLICATION = 'connectdial.wsgi.application'
 
+# ======================
+# DATABASE
+# ======================
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
+    }
+}
+
+# ======================
+# TEMPLATES
+# ======================
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
@@ -97,200 +105,254 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'connectdial.wsgi.application'
+# ======================
+# STATIC & MEDIA (Google Cloud Storage)
+# ======================
+STATIC_URL = 'static/'
 
-# ─────────────────────────────────────────────
-# Database
-# ─────────────────────────────────────────────
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
-
-# ─────────────────────────────────────────────
-# Static & Media (Google Cloud Storage)
-# ─────────────────────────────────────────────
-
-STATIC_URL     = 'static/'
 GS_BUCKET_NAME = 'connectdial-bb223.firebasestorage.app'
-GS_KEY_PATH    = os.path.join(BASE_DIR, 'firebase-service-account.json')
+GS_KEY_PATH = os.path.join(BASE_DIR, 'firebase-service-account.json')
 
 if os.path.exists(GS_KEY_PATH):
     GS_CREDENTIALS = service_account.Credentials.from_service_account_file(GS_KEY_PATH)
     STORAGES = {
-        "default":     {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage"},
+        "default": {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage"},
         "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
     }
     MEDIA_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/'
 else:
-    MEDIA_URL  = '/media/'
+    MEDIA_URL = '/media/'
     MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-GS_DEFAULT_TIMEOUT    = 300
+# Google Cloud Storage tweaks
+GS_DEFAULT_TIMEOUT = 300
 GS_CONNECTION_TIMEOUT = 300
-GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 5   # 5 MB chunks
+GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB
 
-# ─────────────────────────────────────────────
-# Authentication & REST Framework
-# ─────────────────────────────────────────────
+# ======================
+# CORS (⚠️ Change before production!)
+# ======================
+CORS_ALLOW_ALL_ORIGINS = True   # ← Security risk in production
 
+# ======================
+# AUTHENTICATION
+# ======================
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',
 )
 
-REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-        # TokenAuthentication removed — JWT only
-    ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
-    ),
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
-    'DEFAULT_SCHEMA_CLASS':     'drf_spectacular.openapi.AutoSchema',
-    'PAGE_SIZE': 10,
-    'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
-    ],
-    'DEFAULT_THROTTLE_RATES': {
-        'anon':           '200/day',
-        'user':           '2000/day',
-        'login':          '5/minute',
-        'otp':            '5/minute',
-        'password_reset': '3/minute',
-    },
-}
-
-# ─────────────────────────────────────────────
-# JWT (SimpleJWT)
-# ─────────────────────────────────────────────
-
-SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME':    timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME':   timedelta(days=7),
-    'AUTH_HEADER_TYPES':        ('Bearer',),
-    'ROTATE_REFRESH_TOKENS':    True,   # issue new refresh token on each use
-    'BLACKLIST_AFTER_ROTATION': True,   # blacklist old refresh token immediately
-    'UPDATE_LAST_LOGIN':        True,
-}
-
-# ─────────────────────────────────────────────
-# Email (SMTP)
-# ─────────────────────────────────────────────
-
-if DEBUG:
-    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-else:
-    EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_HOST          = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
-    EMAIL_PORT          = int(os.environ.get('EMAIL_PORT', 587))
-    EMAIL_USE_TLS       = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
-    EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
-    EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@connectdial.com')
-
-# ─────────────────────────────────────────────
-# API Documentation (drf-spectacular)
-# ─────────────────────────────────────────────
-
-SPECTACULAR_SETTINGS = {
-    'TITLE':       'ConnectDial API',
-    'DESCRIPTION': 'ConnectDial Backend API Documentation',
-    'VERSION':     '1.0.0',
-}
-
-# ─────────────────────────────────────────────
-# Celery
-# ─────────────────────────────────────────────
-
-from celery.schedules import crontab   # noqa: E402
-
-CELERY_BROKER_URL     = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-CELERY_TIMEZONE       = 'UTC'
-
-CELERY_BEAT_SCHEDULE = {
-    # ── Core social & engagement ──────────────────────────────────
-    'trigger-bot-engagement-every-12h': {
-        'task':     'posts.tasks.coordinate_bot_engagement',
-        'schedule': crontab(hour='*/12'),
-    },
-    'bot-social-expansion-every-8h': {
-        'task':     'posts.tasks.expand_bot_social_graph',
-        'schedule': crontab(hour='*/8'),
-        'args':     (15,),
-    },
-
-    # ── Text/image news sync (staggered every 4 hours) ────────────
-    'sync-premier-league':       {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=0,  hour='*/4'), 'args': ('Premier League',      5)},
-    'sync-nba':                  {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=5,  hour='*/4'), 'args': ('NBA',                 6)},
-    'sync-champions-league':     {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=10, hour='*/4'), 'args': ('Champions League',    5)},
-    'sync-nfl':                  {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=15, hour='*/4'), 'args': ('NFL',                 6)},
-    'sync-la-liga':              {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=20, hour='*/4'), 'args': ('La Liga',             4)},
-    'sync-f1':                   {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=25, hour='*/4'), 'args': ('F1',                  4)},
-    'sync-kenya-premier-league': {'task': 'posts.tasks.sync_bots_with_live_sports', 'schedule': crontab(minute=30, hour='*/4'), 'args': ('Kenya Premier League', 3)},
-
-    # ── YouTube Shorts (staggered every 8 hours) ──────────────────
-    'post-premier-league-shorts':       {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=30, hour='*/8'), 'args': ('Premier League',)},
-    'post-nba-shorts':                  {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=35, hour='*/8'), 'args': ('NBA',)},
-    'post-nfl-shorts':                  {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=40, hour='*/8'), 'args': ('NFL',)},
-    'post-champions-league-shorts':     {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=45, hour='*/8'), 'args': ('Champions League',)},
-    'post-f1-shorts':                   {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=50, hour='*/8'), 'args': ('F1',)},
-    'post-kenya-premier-league-shorts': {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=55, hour='*/8'), 'args': ('Kenya Premier League',)},
-
-    # ── International / secondary (every 12 hours) ────────────────
-    'post-la-liga-shorts':    {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=0,  hour='*/12'), 'args': ('La Liga',)},
-    'post-serie-a-shorts':    {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=5,  hour='*/12'), 'args': ('Serie A',)},
-    'post-bundesliga-shorts': {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=10, hour='*/12'), 'args': ('Bundesliga',)},
-    'post-ligue-1-shorts':    {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=15, hour='*/12'), 'args': ('Ligue 1',)},
-    'post-mlb-shorts':        {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=20, hour='*/12'), 'args': ('MLB',)},
-    'post-nhl-shorts':        {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=25, hour='*/12'), 'args': ('NHL',)},
-    'post-afcon-shorts':      {'task': 'posts.tasks.fetch_and_post_youtube_shorts', 'schedule': crontab(minute=30, hour='*/12'), 'args': ('Afcon',)},
-}
-
-# ─────────────────────────────────────────────
-# External API keys (from .env)
-# ─────────────────────────────────────────────
-
-GEMINI_API_KEY  = os.getenv('GEMINI_API_KEY')
-NEWS_API_KEY    = os.getenv('NEWS_API_KEY')
-YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
-
-# ─────────────────────────────────────────────
-# Google OAuth (django-allauth)
-# ─────────────────────────────────────────────
-
-ACCOUNT_EMAIL_VERIFICATION    = 'none'
+# Allauth settings
+ACCOUNT_EMAIL_VERIFICATION = 'none'
 ACCOUNT_AUTHENTICATION_METHOD = 'email'
-ACCOUNT_EMAIL_REQUIRED        = True
-ACCOUNT_UNIQUE_EMAIL          = True
-SOCIALACCOUNT_AUTO_SIGNUP     = True
-SOCIALACCOUNT_LOGIN_ON_GET    = True
+ACCOUNT_EMAIL_REQUIRED = True
+ACCOUNT_UNIQUE_EMAIL = True
+SOCIALACCOUNT_AUTO_SIGNUP = True
+SOCIALACCOUNT_LOGIN_ON_GET = True
 
 SOCIALACCOUNT_PROVIDERS = {
     'google': {
         'APP': {
             'client_id': os.getenv('GOOGLE_CLIENT_ID'),
-            'secret':    os.getenv('GOOGLE_CLIENT_SECRET'),
-            'key':       '',
+            'secret': os.getenv('GOOGLE_CLIENT_SECRET'),
+            'key': '',
         },
-        'SCOPE':         ['profile', 'email'],
-        'AUTH_PARAMS':   {'access_type': 'online'},
+        'SCOPE': ['profile', 'email'],
+        'AUTH_PARAMS': {'access_type': 'online'},
         'FETCH_USERINFO': True,
     }
 }
 
-REST_AUTH = {
-    'USE_JWT':                    True,
-    'JWT_AUTH_COOKIE':            None,
-    'JWT_AUTH_REFRESH_COOKIE':    None,
-    'TOKEN_MODEL':                None,        # ← add this line
-    'USER_DETAILS_SERIALIZER':    'users.serializers.UserSerializer',   # controls user payload shape
-    'LOGIN_SERIALIZER':           'users.serializers.CustomLoginSerializer',
+# ======================
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
+    'PAGE_SIZE': 10,
+
+    'DEFAULT_THROTTLE_RATES': {
+        'login': '10/min',
+        'otp': '5/min',
+        'password_reset': '5/min',
+    },
 }
+
+# ======================
+# SIMPLE JWT (Improved)
+# ======================
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ROTATE_REFRESH_TOKENS': True,           # ← Recommended
+    'BLACKLIST_AFTER_ROTATION': True,        # ← Recommended
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'ConnectDial API',
+    'DESCRIPTION': 'ConnectDial Backend API Documentation',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'COMPONENT_SPLIT_PATCH': True,
+
+    # 'SWAGGER_UI_DIST': 'SIDECAR',   # Uncomment if using drf-spectacular-sidecar
+    # 'REDOC_DIST': 'SIDECAR',
+}
+
+
+
+# ======================
+# EMAIL (Gmail SMTP)
+# ======================
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@connectdial.com')
+
+# ======================
+# CELERY
+# ======================
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_TIMEZONE = 'UTC'
+
+CELERY_BEAT_SCHEDULE = {
+    # Core tasks
+    'trigger-bot-engagement-every-12h': {
+        'task': 'posts.tasks.coordinate_bot_engagement',
+        'schedule': crontab(hour='*/12'),
+    },
+    'bot-social-expansion': {
+        'task': 'posts.tasks.expand_bot_social_graph',
+        'schedule': crontab(hour='*/8'),
+        'args': (15,),
+    },
+
+    # Sports news sync (staggered)
+    'sync-premier-league': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=0, hour='*/4'),
+        'args': ('Premier League', 5),
+    },
+    'sync-nba': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=5, hour='*/4'),
+        'args': ('NBA', 6),
+    },
+    'sync-champions-league': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=10, hour='*/4'),
+        'args': ('Champions League', 5),
+    },
+    'sync-nfl': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=15, hour='*/4'),
+        'args': ('NFL', 6),
+    },
+    'sync-la-liga': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=20, hour='*/4'),
+        'args': ('La Liga', 4),
+    },
+    'sync-f1': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=25, hour='*/4'),
+        'args': ('F1', 4),
+    },
+    'sync-kenya-premier-league': {
+        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'schedule': crontab(minute=30, hour='*/4'),
+        'args': ('Kenya Premier League', 3),
+    },
+
+    # YouTube Shorts (staggered)
+    'post-premier-league-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=30, hour='*/8'),
+        'args': ('Premier League',),
+    },
+    'post-nba-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=35, hour='*/8'),
+        'args': ('NBA',),
+    },
+    'post-nfl-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=40, hour='*/8'),
+        'args': ('NFL',),
+    },
+    'post-champions-league-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=45, hour='*/8'),
+        'args': ('Champions League',),
+    },
+    'post-f1-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=50, hour='*/8'),
+        'args': ('F1',),
+    },
+    'post-kenya-premier-league-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=55, hour='*/8'),
+        'args': ('Kenya Premier League',),
+    },
+
+    # Lower priority leagues (every 12h)
+    'post-la-liga-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=0, hour='*/12'),
+        'args': ('La Liga',),
+    },
+    'post-serie-a-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=5, hour='*/12'),
+        'args': ('Serie A',),
+    },
+    'post-bundesliga-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=10, hour='*/12'),
+        'args': ('Bundesliga',),
+    },
+    'post-ligue-1-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=15, hour='*/12'),
+        'args': ('Ligue 1',),
+    },
+    'post-mlb-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=20, hour='*/12'),
+        'args': ('MLB',),
+    },
+    'post-nhl-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=25, hour='*/12'),
+        'args': ('NHL',),
+    },
+    'post-afcon-shorts': {
+        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'schedule': crontab(minute=30, hour='*/12'),
+        'args': ('Afcon',),
+    },
+}
+
+# ======================
+# EXTERNAL API KEYS
+# ======================
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
+
+# ======================
+# OTP SETTINGS
+# ======================
+OTP_EXPIRY_SECONDS = 300
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN = 30
