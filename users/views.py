@@ -11,7 +11,7 @@ Includes:
   - Logout
   - Token check
   - Toggle follow
-  - Google Sign-In (JWT)
+  - Google Sign-In (DRF Token)
   - Custom Login (DRF Token)
   - Register, Onboard, Profile CRUD
   - Audit logging & login history
@@ -23,17 +23,20 @@ import pyotp
 import qrcode
 import io
 import base64
+import hmac
+import hashlib
 from datetime import timedelta
 
 from django.core.mail import send_mail
 from django.core.validators import validate_email
 from django.utils import timezone
 from django.conf import settings
-from django.contrib.auth.hashers import make_password
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from rest_framework.exceptions import ValidationError
 
 from rest_framework.views import APIView
-from rest_framework import generics, permissions, status, filters
+from rest_framework import generics, status, filters
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -45,15 +48,28 @@ from dj_rest_auth.views import LoginView
 from allauth.socialaccount.models import SocialAccount
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
-from rest_framework_simplejwt.tokens import RefreshToken, AccessToken
 
-from .models import User, Profile, FanPreference, Follow, OTPCode, AuditLog, LoginHistory, PasswordResetOTP
+from .models import (
+    User, Profile, FanPreference, Follow,
+    OTPCode, AuditLog, LoginHistory, PasswordResetOTP,
+)
 from .serializers import (
     UserSerializer,
     OnboardingSerializer,
     ProfileSerializer,
     CustomLoginSerializer,
 )
+
+
+# ─────────────────────────────────────────────
+# AUTO-CREATE PROFILE ON USER CREATION
+# ─────────────────────────────────────────────
+
+@receiver(post_save, sender=User)
+def create_user_profile(sender, instance, created, **kwargs):
+    """Ensure every new User gets a Profile automatically."""
+    if created:
+        Profile.objects.get_or_create(user=instance)
 
 
 # ─────────────────────────────────────────────
@@ -80,15 +96,7 @@ def generate_otp(length=6):
 
 
 def send_otp_email(user, otp_code, subject, purpose_label):
-    """
-    Send an OTP email to the given user.
-
-    Args:
-        user:           A User model instance (not a string).
-        otp_code:       The OTP string to include in the email.
-        subject:        Email subject line.
-        purpose_label:  Human-readable label, e.g. "email verification".
-    """
+    """Send an OTP email to the given user."""
     send_mail(
         subject=subject,
         message=(
@@ -102,43 +110,59 @@ def send_otp_email(user, otp_code, subject, purpose_label):
     )
 
 
-# Mapping from OTP purpose slug → human-readable label & email subject
 OTP_PURPOSE_META = {
-    'login':          {'label': 'one-time login',      'subject': 'Your Login OTP'},
-    'password_reset': {'label': 'password reset',      'subject': 'Password Reset OTP'},
-    'email_verify':   {'label': 'email verification',  'subject': 'Verify Your Email'},
+    'login':          {'label': 'one-time login',     'subject': 'Your Login OTP'},
+    'password_reset': {'label': 'password reset',     'subject': 'Password Reset OTP'},
+    'email_verify':   {'label': 'email verification', 'subject': 'Verify Your Email'},
 }
 
 def _otp_meta(purpose: str) -> dict:
-    """Return {'label': ..., 'subject': ...} for the given purpose, with safe fallback."""
     return OTP_PURPOSE_META.get(
         purpose,
         {'label': purpose.replace('_', ' '), 'subject': f'Your {purpose.replace("_", " ").title()} OTP'},
     )
 
 
-def _issue_scoped_token(user, scope: str, lifetime: timedelta) -> str:
-    token = AccessToken.for_user(user)
-    token.set_exp(lifetime=lifetime)
-    token['scope'] = scope
-    return str(token)
+def _issue_signed_reset_token(user) -> str:
+    """
+    HMAC-SHA256 signed reset token.
+    Format: {user_id}:{timestamp}:{hex_signature}
+    Valid for 15 minutes.
+    """
+    timestamp = int(timezone.now().timestamp())
+    payload   = f"{user.id}:{timestamp}".encode()
+    secret    = settings.SECRET_KEY.encode()
+    signature = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()  # ← fixed
+    return f"{user.id}:{timestamp}:{signature}"
 
 
-def _decode_scoped_token(raw_token: str, expected_scope: str):
+def _decode_signed_reset_token(raw_token: str):
+    """
+    Validate and decode a signed reset token.
+    Returns the User instance or raises ValueError.
+    """
     try:
-        token = AccessToken(raw_token)
-    except Exception:
-        raise ValueError('Invalid or expired token.')
+        parts = raw_token.strip().split(":")
+        if len(parts) != 3:
+            raise ValueError("Malformed token.")
 
-    if token.get('scope') != expected_scope:
-        raise ValueError(f'Token scope mismatch. Expected {expected_scope}.')
+        user_id, timestamp, signature = parts
+        payload      = f"{user_id}:{timestamp}".encode()
+        secret       = settings.SECRET_KEY.encode()
+        expected_sig = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()  # ← fixed
 
-    try:
-        user = User.objects.get(id=token['user_id'])
+        if not hmac.compare_digest(expected_sig, signature):
+            raise ValueError("Invalid token signature.")
+
+        if (int(timezone.now().timestamp()) - int(timestamp)) > 900:
+            raise ValueError("Reset token has expired.")
+
+        return User.objects.get(id=int(user_id))
+
     except User.DoesNotExist:
-        raise ValueError('User not found.')
-
-    return user
+        raise ValueError("User not found.")
+    except (TypeError, ValueError) as e:
+        raise ValueError(str(e))
 
 
 def _get_user_by_identifier(identifier: str):
@@ -161,31 +185,39 @@ def _get_user_by_identifier(identifier: str):
 
 
 def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = None):
-    """Centralized audit logging."""
-    AuditLog.objects.create(
-        user=user,
-        action=action,
-        ip_address=ip,
-        device_info=device or "Unknown",
-        extra=extra or {},
-    )
+    """Centralized audit logging — silently skips unknown action values."""
+    try:
+        AuditLog.objects.create(
+            user=user,
+            action=action,
+            ip_address=ip or None,
+            device_info=device or "Unknown",
+            extra=extra or {},
+        )
+    except Exception:
+        pass  # Never let audit logging crash a real request
 
 
 def _log_login(user, request):
     """Log successful login with IP & device."""
-    ip = request.META.get("HTTP_X_FORWARDED_FOR") or request.META.get("REMOTE_ADDR")
+    ip     = request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip() \
+             or request.META.get("REMOTE_ADDR")
     device = request.META.get("HTTP_USER_AGENT", "Unknown Device")
-    LoginHistory.objects.create(
-        user=user,
-        ip_address=ip,
-        device_info=device,
-        success=True,
-    )
+
+    try:
+        LoginHistory.objects.create(
+            user=user,
+            ip_address=ip or None,
+            device_info=device,
+            success=True,
+        )
+    except Exception:
+        pass  # Never let login history crash a real request
+
     _log_audit(user, "login_success", ip, device)
 
 
 def _make_unique_username(base: str) -> str:
-    """Return a unique username derived from base, appending a numeric suffix if needed."""
     username = base[:150]
     if not User.objects.filter(username=username).exists():
         return username
@@ -197,14 +229,10 @@ def _make_unique_username(base: str) -> str:
         suffix += 1
 
 
-def _jwt_response(user, extra=None):
-    """Build a JWT token response payload for a user."""
-    refresh = RefreshToken.for_user(user)
-    payload = {
-        'access': str(refresh.access_token),
-        'refresh': str(refresh),
-        'user': UserSerializer(user).data,
-    }
+def _token_response(user, extra=None):
+    """Build a DRF Token response payload for a user."""
+    token, _ = Token.objects.get_or_create(user=user)
+    payload  = {'key': token.key, 'user': UserSerializer(user).data}
     if extra:
         payload.update(extra)
     return payload
@@ -215,17 +243,15 @@ def _jwt_response(user, extra=None):
 # ─────────────────────────────────────────────
 
 class SendEmailVerificationView(APIView):
-    """
-    POST /auth/email/send-verification/
-    Sends a 6-digit OTP to the authenticated user's email for verification.
-    """
+    """POST /auth/email/send-verification/"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
+        user    = request.user
+        profile, _ = Profile.objects.get_or_create(user=user)
 
-        if user.profile.email_verified:
+        if profile.email_verified:
             return Response(
                 {"detail": "Email is already verified."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -234,33 +260,23 @@ class SendEmailVerificationView(APIView):
         otp = generate_otp()
         OTPCode.objects.filter(user=user, purpose="email_verify").delete()
         OTPCode.objects.create(
-            user=user,
-            code=otp,
-            purpose="email_verify",
+            user=user, code=otp, purpose="email_verify",
             expires_at=timezone.now() + timedelta(minutes=10),
         )
 
         meta = _otp_meta("email_verify")
         send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
-
-        return Response(
-            {"detail": "Verification OTP sent to your email."},
-            status=status.HTTP_200_OK,
-        )
+        return Response({"detail": "Verification OTP sent to your email."}, status=status.HTTP_200_OK)
 
 
 class VerifyEmailView(APIView):
-    """
-    POST /auth/email/verify/
-    Body: { "otp": "123456" }
-    Marks the user's email as verified.
-    """
+    """POST /auth/email/verify/ — Body: { "otp": "123456" }"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
         otp_input = request.data.get("otp", "").strip()
-        user = request.user
+        user      = request.user
 
         if not otp_input:
             return Response({"detail": "otp is required."}, status=status.HTTP_400_BAD_REQUEST)
@@ -272,12 +288,9 @@ class VerifyEmailView(APIView):
 
         if record.expires_at < timezone.now():
             record.delete()
-            return Response(
-                {"detail": "OTP has expired. Please request a new one."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": "OTP has expired."}, status=status.HTTP_400_BAD_REQUEST)
 
-        profile = user.profile
+        profile, _ = Profile.objects.get_or_create(user=user)
         profile.email_verified = True
         profile.save()
         record.delete()
@@ -293,11 +306,9 @@ class SendOTPView(APIView):
     """
     POST /auth/otp/send/
     Body: { "email": "user@example.com", "purpose": "login" }
-
-    Supported purposes: login | password_reset | email_verify
     """
     permission_classes = [AllowAny]
-    throttle_classes = [OTPThrottle]
+    throttle_classes   = [OTPThrottle]
 
     def post(self, request):
         email   = request.data.get("email", "").strip().lower()
@@ -306,7 +317,6 @@ class SendOTPView(APIView):
         if not email:
             return Response({"detail": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Always return the same message to prevent user enumeration
         generic_response = Response(
             {"detail": "If that email exists, an OTP has been sent."},
             status=status.HTTP_200_OK,
@@ -320,15 +330,12 @@ class SendOTPView(APIView):
         otp = generate_otp()
         OTPCode.objects.filter(user=user, purpose=purpose).delete()
         OTPCode.objects.create(
-            user=user,
-            code=otp,
-            purpose=purpose,
+            user=user, code=otp, purpose=purpose,
             expires_at=timezone.now() + timedelta(minutes=10),
         )
 
         meta = _otp_meta(purpose)
         send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
-
         return generic_response
 
 
@@ -336,13 +343,9 @@ class VerifyOTPView(APIView):
     """
     POST /auth/otp/verify/
     Body: { "identifier": "user@example.com", "otp": "123456", "purpose": "login" }
-
-    - purpose "login"          → returns DRF token + user data
-    - purpose "password_reset" → returns a short-lived scoped reset_token
-    - purpose "email_verify"   → marks email as verified, returns confirmation
     """
     permission_classes = [AllowAny]
-    throttle_classes = [OTPThrottle]
+    throttle_classes   = [OTPThrottle]
 
     def post(self, request):
         identifier = (request.data.get('identifier') or request.data.get('email', '')).strip()
@@ -359,45 +362,32 @@ class VerifyOTPView(APIView):
         if not user:
             return Response({'error': 'Invalid request.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # All OTP sends use OTPCode — query it consistently here
         try:
             otp_obj = OTPCode.objects.get(user=user, code=otp_code, purpose=purpose)
         except OTPCode.DoesNotExist:
-            return Response(
-                {'error': 'Invalid or expired OTP.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({'error': 'Invalid or expired OTP.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if otp_obj.expires_at < timezone.now():
             otp_obj.delete()
-            return Response(
-                {'error': 'OTP has expired. Please request a new one.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # OTP is valid — consume it
         otp_obj.delete()
-
-        ip = request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')
-
-        # ── Purpose-specific responses ──────────────────────────────────────
+        ip = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() \
+             or request.META.get('REMOTE_ADDR')
 
         if purpose == 'password_reset':
-            reset_token = _issue_scoped_token(user, 'password_reset', timedelta(minutes=15))
+            reset_token = _issue_signed_reset_token(user)
             _log_audit(user, 'password_reset_otp_verified', ip)
             return Response({'reset_token': reset_token}, status=status.HTTP_200_OK)
 
         if purpose == 'email_verify':
-            profile = user.profile
+            profile, _ = Profile.objects.get_or_create(user=user)
             profile.email_verified = True
             profile.save()
             _log_audit(user, 'email_verified_via_otp', ip)
-            return Response(
-                {'detail': 'Email verified successfully.'},
-                status=status.HTTP_200_OK,
-            )
+            return Response({'detail': 'Email verified successfully.'}, status=status.HTTP_200_OK)
 
-        # Default: login — issue a DRF token
+        # Default: login
         token, _ = Token.objects.get_or_create(user=user)
         _log_login(user, request)
         return Response(
@@ -411,13 +401,9 @@ class VerifyOTPView(APIView):
 # ─────────────────────────────────────────────
 
 class ForgotPasswordView(APIView):
-    """
-    POST /auth/password/forgot/
-    Body: { "email": "user@example.com" }
-    Sends a password-reset OTP to the given email address.
-    """
+    """POST /auth/password/forgot/ — Body: { "email": "..." }"""
     permission_classes = [AllowAny]
-    throttle_classes = [PasswordResetThrottle]
+    throttle_classes   = [PasswordResetThrottle]
 
     def post(self, request):
         email = request.data.get("email", "").strip().lower()
@@ -438,26 +424,17 @@ class ForgotPasswordView(APIView):
         otp = generate_otp()
         OTPCode.objects.filter(user=user, purpose="password_reset").delete()
         OTPCode.objects.create(
-            user=user,
-            code=otp,
-            purpose="password_reset",
+            user=user, code=otp, purpose="password_reset",
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
         meta = _otp_meta("password_reset")
         send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
-
         return generic_response
 
 
 class ResetPasswordView(APIView):
-    """
-    POST /auth/password/reset/
-    Body: { "reset_token": "<scoped JWT>", "new_password": "..." }
-
-    The reset_token is the scoped JWT issued by VerifyOTPView after a
-    successful password_reset OTP check.
-    """
+    """POST /auth/password/reset/ — Body: { "reset_token": "...", "new_password": "..." }"""
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -477,21 +454,20 @@ class ResetPasswordView(APIView):
             )
 
         try:
-            user = _decode_scoped_token(raw_token, 'password_reset')
+            user = _decode_signed_reset_token(raw_token)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         user.set_password(new_password)
         user.save()
-
-        # Invalidate all existing DRF tokens so the user must log in fresh
         Token.objects.filter(user=user).delete()
 
-        ip = request.META.get('HTTP_X_FORWARDED_FOR') or request.META.get('REMOTE_ADDR')
+        ip = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() \
+             or request.META.get('REMOTE_ADDR')
         _log_audit(user, 'password_reset_completed', ip)
 
         return Response(
-            {"detail": "Password has been reset successfully. Please log in again."},
+            {"detail": "Password reset successfully. Please log in again."},
             status=status.HTTP_200_OK,
         )
 
@@ -501,12 +477,9 @@ class ResetPasswordView(APIView):
 # ─────────────────────────────────────────────
 
 class ChangePasswordView(APIView):
-    """
-    POST /auth/password/change/
-    Body: { "old_password": "...", "new_password": "..." }
-    """
+    """POST /auth/password/change/ — Body: { "old_password": "...", "new_password": "..." }"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
         old_password = request.data.get("old_password", "")
@@ -519,21 +492,14 @@ class ChangePasswordView(APIView):
             )
 
         if not request.user.check_password(old_password):
-            return Response(
-                {"detail": "Current password is incorrect."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": "Current password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
 
         if len(new_password) < 8:
-            return Response(
-                {"detail": "New password must be at least 8 characters."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": "New password must be at least 8 characters."}, status=status.HTTP_400_BAD_REQUEST)
 
         request.user.set_password(new_password)
         request.user.save()
 
-        # Rotate the DRF token on password change
         Token.objects.filter(user=request.user).delete()
         new_token = Token.objects.create(user=request.user)
 
@@ -544,30 +510,27 @@ class ChangePasswordView(APIView):
 
 
 # ─────────────────────────────────────────────
-# 2FA — TOTP (Google Authenticator / Authy)
+# 2FA — TOTP
 # ─────────────────────────────────────────────
 
 class Setup2FAView(APIView):
-    """
-    POST /auth/2fa/setup/
-    Generates a TOTP secret + QR code for the authenticated user.
-    """
+    """POST /auth/2fa/setup/"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        user    = request.user
-        profile = user.profile
+        user       = request.user
+        profile, _ = Profile.objects.get_or_create(user=user)
 
-        secret = pyotp.random_base32()
-        profile.totp_secret    = secret
+        secret               = pyotp.random_base32()
+        profile.totp_secret  = secret
         profile.two_fa_enabled = False
         profile.save()
 
         totp    = pyotp.TOTP(secret)
         otp_uri = totp.provisioning_uri(
             name=user.email,
-            issuer_name=getattr(settings, "APP_NAME", "MyApp"),
+            issuer_name=getattr(settings, "APP_NAME", "ConnectDial"),
         )
 
         img    = qrcode.make(otp_uri)
@@ -575,28 +538,21 @@ class Setup2FAView(APIView):
         img.save(buffer, format="PNG")
         qr_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        return Response(
-            {
-                "secret":   secret,
-                "qr_code":  f"data:image/png;base64,{qr_b64}",
-                "detail":   "Scan the QR code with your authenticator app, then verify to activate 2FA.",
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response({
+            "secret":  secret,
+            "qr_code": f"data:image/png;base64,{qr_b64}",
+            "detail":  "Scan the QR code, then call /auth/2fa/verify-setup/ to activate.",
+        }, status=status.HTTP_200_OK)
 
 
 class Verify2FASetupView(APIView):
-    """
-    POST /auth/2fa/verify-setup/
-    Body: { "totp_code": "123456" }
-    Confirms the TOTP secret and enables 2FA on the account.
-    """
+    """POST /auth/2fa/verify-setup/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        totp_code = request.data.get("totp_code", "").strip()
-        profile   = request.user.profile
+        totp_code  = request.data.get("totp_code", "").strip()
+        profile, _ = Profile.objects.get_or_create(user=request.user)
 
         if not profile.totp_secret:
             return Response(
@@ -604,93 +560,64 @@ class Verify2FASetupView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        totp = pyotp.TOTP(profile.totp_secret)
-        if not totp.verify(totp_code, valid_window=1):
-            return Response(
-                {"detail": "Invalid TOTP code. Please try again."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if not pyotp.TOTP(profile.totp_secret).verify(totp_code, valid_window=1):
+            return Response({"detail": "Invalid TOTP code."}, status=status.HTTP_400_BAD_REQUEST)
 
         profile.two_fa_enabled = True
         profile.save()
-        return Response({"detail": "2FA has been enabled successfully."}, status=status.HTTP_200_OK)
+        return Response({"detail": "2FA enabled successfully."}, status=status.HTTP_200_OK)
 
 
 class Validate2FAView(APIView):
-    """
-    POST /auth/2fa/validate/
-    Body: { "totp_code": "123456" }
-    Validates a TOTP code for an already-enabled 2FA account.
-    """
+    """POST /auth/2fa/validate/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        totp_code = request.data.get("totp_code", "").strip()
-        profile   = request.user.profile
+        totp_code  = request.data.get("totp_code", "").strip()
+        profile, _ = Profile.objects.get_or_create(user=request.user)
 
         if not profile.two_fa_enabled or not profile.totp_secret:
-            return Response(
-                {"detail": "2FA is not enabled on this account."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": "2FA is not enabled."}, status=status.HTTP_400_BAD_REQUEST)
 
-        totp = pyotp.TOTP(profile.totp_secret)
-        if not totp.verify(totp_code, valid_window=1):
+        if not pyotp.TOTP(profile.totp_secret).verify(totp_code, valid_window=1):
             return Response({"detail": "Invalid TOTP code."}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({"detail": "2FA verified. Access granted."}, status=status.HTTP_200_OK)
 
 
 class Disable2FAView(APIView):
-    """
-    POST /auth/2fa/disable/
-    Body: { "totp_code": "123456" }
-    Requires a valid TOTP code to confirm the disable action.
-    """
+    """POST /auth/2fa/disable/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        totp_code = request.data.get("totp_code", "").strip()
-        profile   = request.user.profile
+        totp_code  = request.data.get("totp_code", "").strip()
+        profile, _ = Profile.objects.get_or_create(user=request.user)
 
         if not profile.two_fa_enabled:
-            return Response(
-                {"detail": "2FA is not currently enabled."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"detail": "2FA is not currently enabled."}, status=status.HTTP_400_BAD_REQUEST)
 
-        totp = pyotp.TOTP(profile.totp_secret)
-        if not totp.verify(totp_code, valid_window=1):
-            return Response(
-                {"detail": "Invalid TOTP code. 2FA was NOT disabled."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if not pyotp.TOTP(profile.totp_secret).verify(totp_code, valid_window=1):
+            return Response({"detail": "Invalid TOTP code. 2FA was NOT disabled."}, status=status.HTTP_400_BAD_REQUEST)
 
         profile.two_fa_enabled = False
         profile.totp_secret    = None
         profile.save()
-        return Response({"detail": "2FA has been disabled."}, status=status.HTTP_200_OK)
+        return Response({"detail": "2FA disabled."}, status=status.HTTP_200_OK)
 
 
 class Get2FAStatusView(APIView):
-    """
-    GET /auth/2fa/status/
-    Returns the 2FA and email-verification status for the authenticated user.
-    """
+    """GET /auth/2fa/status/"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def get(self, request):
-        profile = request.user.profile
-        return Response(
-            {
-                "two_fa_enabled":  profile.two_fa_enabled,
-                "email_verified":  profile.email_verified,
-            },
-            status=status.HTTP_200_OK,
-        )
+        profile, _ = Profile.objects.get_or_create(user=request.user)
+        return Response({
+            "two_fa_enabled": profile.two_fa_enabled,
+            "email_verified": profile.email_verified,
+        }, status=status.HTTP_200_OK)
 
 
 # ─────────────────────────────────────────────
@@ -698,12 +625,9 @@ class Get2FAStatusView(APIView):
 # ─────────────────────────────────────────────
 
 class CheckTokenView(APIView):
-    """
-    GET /auth/token/check/
-    Returns the current user's data if the token is valid.
-    """
+    """GET /auth/token/check/"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def get(self, request):
         return Response(
@@ -713,51 +637,31 @@ class CheckTokenView(APIView):
 
 
 # ─────────────────────────────────────────────
-# GOOGLE SIGN-IN (JWT)
+# GOOGLE SIGN-IN (DRF Token)
 # ─────────────────────────────────────────────
 
 class GoogleSignInView(APIView):
-    """
-    POST /auth/social/google/
-    Body: { "id_token": "<google id token>" }
-    Verifies the Google ID token, creates or retrieves the user, and
-    returns a JWT pair + user data.
-    """
+    """POST /auth/social/google/ — Body: { "id_token": "..." }"""
     permission_classes = [AllowAny]
-    throttle_classes = [LoginThrottle]
+    throttle_classes   = [LoginThrottle]
 
     def post(self, request):
         raw_token = request.data.get('id_token', '').strip()
         if not raw_token:
-            return Response(
-                {'error': 'id_token is required.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({'error': 'id_token is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
 
-        idinfo = None
-        for cid in [client_id]:
-            try:
-                idinfo = google_id_token.verify_oauth2_token(
-                    raw_token, google_requests.Request(), cid
-                )
-                break
-            except ValueError:
-                continue
-
-        if idinfo is None:
-            return Response(
-                {'error': 'Invalid Google token.'},
-                status=status.HTTP_401_UNAUTHORIZED,
+        try:
+            idinfo = google_id_token.verify_oauth2_token(
+                raw_token, google_requests.Request(), client_id
             )
+        except ValueError:
+            return Response({'error': 'Invalid Google token.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         email = idinfo.get('email')
         if not email or not idinfo.get('email_verified', False):
-            return Response(
-                {'error': 'Invalid or unverified Google email.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({'error': 'Invalid or unverified Google email.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             user    = User.objects.get(email__iexact=email)
@@ -765,8 +669,7 @@ class GoogleSignInView(APIView):
         except User.DoesNotExist:
             username = _make_unique_username(email.split('@')[0])
             user = User.objects.create_user(
-                username=username,
-                email=email,
+                username=username, email=email,
                 first_name=idinfo.get('given_name', ''),
                 last_name=idinfo.get('family_name', ''),
             )
@@ -779,7 +682,7 @@ class GoogleSignInView(APIView):
         _log_login(user, request)
 
         return Response(
-            _jwt_response(user, {'is_new_user': created}),
+            _token_response(user, {'is_new_user': created}),
             status=status.HTTP_200_OK,
         )
 
@@ -789,12 +692,9 @@ class GoogleSignInView(APIView):
 # ─────────────────────────────────────────────
 
 class ToggleFollowView(APIView):
-    """
-    POST /auth/users/<user_id>/follow/
-    Follows or unfollows the target user. Cannot follow yourself.
-    """
+    """POST /auth/users/<user_id>/follow/"""
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request, user_id):
         follower = request.user
@@ -804,33 +704,24 @@ class ToggleFollowView(APIView):
             return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
         if follower == target_user:
-            return Response(
-                {"error": "You cannot follow yourself"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"error": "You cannot follow yourself"}, status=status.HTTP_400_BAD_REQUEST)
 
         follow_rel = Follow.objects.filter(follower=follower, followed=target_user)
 
         if follow_rel.exists():
             follow_rel.delete()
-            return Response(
-                {
-                    "following":      False,
-                    "message":        f"Unfollowed {target_user.username}",
-                    "follower_count": target_user.followers.count(),
-                },
-                status=status.HTTP_200_OK,
-            )
-        else:
-            Follow.objects.create(follower=follower, followed=target_user)
-            return Response(
-                {
-                    "following":      True,
-                    "message":        f"Following {target_user.username}",
-                    "follower_count": target_user.followers.count(),
-                },
-                status=status.HTTP_201_CREATED,
-            )
+            return Response({
+                "following":      False,
+                "message":        f"Unfollowed {target_user.username}",
+                "follower_count": target_user.followers.count(),
+            }, status=status.HTTP_200_OK)
+
+        Follow.objects.create(follower=follower, followed=target_user)
+        return Response({
+            "following":      True,
+            "message":        f"Following {target_user.username}",
+            "follower_count": target_user.followers.count(),
+        }, status=status.HTTP_201_CREATED)
 
 
 # ─────────────────────────────────────────────
@@ -838,15 +729,15 @@ class ToggleFollowView(APIView):
 # ─────────────────────────────────────────────
 
 class RegisterView(generics.CreateAPIView):
-    queryset          = User.objects.all()
-    serializer_class  = UserSerializer
+    queryset           = User.objects.all()
+    serializer_class   = UserSerializer
     permission_classes = [AllowAny]
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
         if response.status_code == 201:
-            user = User.objects.get(id=response.data['id'])
-            token, created = Token.objects.get_or_create(user=user)
+            user     = User.objects.get(id=response.data['id'])
+            token, _ = Token.objects.get_or_create(user=user)
             response.data['token'] = token.key
         return response
 
@@ -890,20 +781,14 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
         username = self.request.query_params.get("username")
 
         if user_id:
-            try:
-                return Profile.objects.get(user_id=user_id)
-            except Profile.DoesNotExist:
-                user    = User.objects.get(id=user_id)
-                profile, _ = Profile.objects.get_or_create(user=user)
-                return profile
+            user       = User.objects.get(id=user_id)
+            profile, _ = Profile.objects.get_or_create(user=user)
+            return profile
 
         if username:
-            try:
-                return Profile.objects.get(user__username=username)
-            except Profile.DoesNotExist:
-                user    = User.objects.get(username=username)
-                profile, _ = Profile.objects.get_or_create(user=user)
-                return profile
+            user       = User.objects.get(username=username)
+            profile, _ = Profile.objects.get_or_create(user=user)
+            return profile
 
         profile, _ = Profile.objects.get_or_create(user=self.request.user)
         return profile
@@ -936,9 +821,9 @@ class CustomLoginView(LoginView):
         response = super().post(request, *args, **kwargs)
 
         if response.status_code == 200:
-            token_key         = response.data.get("key")
-            token             = Token.objects.get(key=token_key)
-            user              = token.user
+            token_key             = response.data.get("key")
+            token                 = Token.objects.get(key=token_key)
+            user                  = token.user
             response.data["user"] = UserSerializer(user).data
             _log_login(user, request)
 
@@ -950,15 +835,12 @@ class CustomLoginView(LoginView):
 # ─────────────────────────────────────────────
 
 class LogoutView(APIView):
-    """
-    POST /auth/logout/
-    Clears the FCM token and deletes the DRF auth token.
-    """
+    """POST /auth/logout/"""
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        profile           = request.user.profile
+        profile, _ = Profile.objects.get_or_create(user=request.user)
         profile.fcm_token = None
         profile.save()
 

@@ -17,8 +17,8 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [
-    '192.168.100.107', 'localhost', '127.0.0.1',
-    '10.126.232.156', '192.168.100.108', '10.199.198.201','10.199.198.22'
+    '192.168.100.107', 'localhost', '127.0.0.1', '0.0.0.0',
+    '10.126.232.156', '192.168.100.108', '10.199.198.201', '10.199.198.22','192.168.100.107'
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -81,24 +81,16 @@ WSGI_APPLICATION = 'connectdial.wsgi.application'
 # DATABASE
 # ======================
 DATABASES = {
-
     'default': {
-
         'ENGINE': 'django.db.backends.postgresql',
-
         'NAME': 'connectdial_db',
-
         'USER': 'gilly',
-
         'PASSWORD': 'Iam1@Nitronitro',
-
         'HOST': 'localhost',
-
         'PORT': '5432',
-
     }
-
 }
+
 # ======================
 # TEMPLATES
 # ======================
@@ -144,7 +136,7 @@ GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB
 # ======================
 # CORS (⚠️ Change before production!)
 # ======================
-CORS_ALLOW_ALL_ORIGINS = True   # ← Security risk in production
+CORS_ALLOW_ALL_ORIGINS = True  # ← Security risk in production
 
 # ======================
 # AUTHENTICATION
@@ -176,15 +168,18 @@ SOCIALACCOUNT_PROVIDERS = {
 }
 
 # ======================
+# REST FRAMEWORK
+# ======================
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'rest_framework.authentication.TokenAuthentication',  # ← DRF Token Auth
     ),
-    'DEFAULT_PERMISSION_CLASSES': ('rest_framework.permissions.IsAuthenticated',),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
-
     'DEFAULT_THROTTLE_RATES': {
         'login': '10/min',
         'otp': '5/min',
@@ -193,25 +188,17 @@ REST_FRAMEWORK = {
 }
 
 # ======================
-# SIMPLE JWT (Improved)
-# ======================
-SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
-    'ROTATE_REFRESH_TOKENS': True,           # ← Recommended
-    'BLACKLIST_AFTER_ROTATION': True,        # ← Recommended
-    'AUTH_HEADER_TYPES': ('Bearer',),
-    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
-}
-
-# ======================
-# DJ-REST-AUTH (DRF Token)
+# DJ-REST-AUTH
 # ======================
 REST_AUTH = {
     'USE_JWT': False,
+    'TOKEN_MODEL': 'rest_framework.authtoken.models.Token',
     'OLD_PASSWORD_FIELD_ENABLED': True,
 }
 
+# ======================
+# DRF SPECTACULAR
+# ======================
 SPECTACULAR_SETTINGS = {
     'TITLE': 'ConnectDial API',
     'DESCRIPTION': 'ConnectDial Backend API Documentation',
@@ -219,12 +206,7 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
     'COMPONENT_SPLIT_PATCH': True,
-
-    # 'SWAGGER_UI_DIST': 'SIDECAR',   # Uncomment if using drf-spectacular-sidecar
-    # 'REDOC_DIST': 'SIDECAR',
 }
-
-
 
 # ======================
 # EMAIL (Gmail SMTP)
