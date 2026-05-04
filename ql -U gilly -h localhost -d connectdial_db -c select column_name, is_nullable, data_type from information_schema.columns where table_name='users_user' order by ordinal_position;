@@ -1,0 +1,50 @@
+                      List of relations
+ Schema |                Name                 | Type  | Owner 
+--------+-------------------------------------+-------+-------
+ public | account_emailaddress                | table | gilly
+ public | account_emailconfirmation           | table | gilly
+ public | auth_group                          | table | gilly
+ public | auth_group_permissions              | table | gilly
+ public | auth_permission                     | table | gilly
+ public | authtoken_token                     | table | gilly
+ public | django_admin_log                    | table | gilly
+ public | django_celery_beat_clockedschedule  | table | gilly
+ public | django_celery_beat_crontabschedule  | table | gilly
+ public | django_celery_beat_intervalschedule | table | gilly
+ public | django_celery_beat_periodictask     | table | gilly
+ public | django_celery_beat_periodictasks    | table | gilly
+ public | django_celery_beat_solarschedule    | table | gilly
+ public | django_content_type                 | table | gilly
+ public | django_migrations                   | table | gilly
+ public | django_session                      | table | gilly
+ public | django_site                         | table | gilly
+ public | leagues_league                      | table | gilly
+ public | leagues_team                        | table | gilly
+ public | notifications_notification          | table | gilly
+ public | posts_comment                       | table | gilly
+ public | posts_commentlike                   | table | gilly
+ public | posts_hashtag                       | table | gilly
+ public | posts_post                          | table | gilly
+ public | posts_post_hashtags                 | table | gilly
+ public | posts_post_mentions                 | table | gilly
+ public | posts_postlike                      | table | gilly
+ public | posts_postshare                     | table | gilly
+ public | posts_videoengagement               | table | gilly
+ public | short_videos_shortvideo             | table | gilly
+ public | socialaccount_socialaccount         | table | gilly
+ public | socialaccount_socialapp             | table | gilly
+ public | socialaccount_socialapp_sites       | table | gilly
+ public | socialaccount_socialtoken           | table | gilly
+ public | users_auditlog                      | table | gilly
+ public | users_fanpreference                 | table | gilly
+ public | users_follow                        | table | gilly
+ public | users_loginhistory                  | table | gilly
+ public | users_passwordresetotp              | table | gilly
+ public | users_profile                       | table | gilly
+ public | users_twofactorotp                  | table | gilly
+ public | users_user                          | table | gilly
+ public | users_user_groups                   | table | gilly
+ public | users_user_user_permissions         | table | gilly
+ public | users_usersession                   | table | gilly
+(45 rows)
+

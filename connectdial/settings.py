@@ -13,12 +13,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # ======================
 # SECURITY & CORE
 # ======================
-SECRET_KEY = os.environ.get('SECRET_KEY')
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [
     '192.168.100.107', 'localhost', '127.0.0.1',
-    '10.126.232.156', '192.168.100.4', '10.199.198.201','10.199.198.22'
+    '10.126.232.156', '192.168.100.108', '10.199.198.201','10.199.198.22'
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -81,12 +81,24 @@ WSGI_APPLICATION = 'connectdial.wsgi.application'
 # DATABASE
 # ======================
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
-}
 
+    'default': {
+
+        'ENGINE': 'django.db.backends.postgresql',
+
+        'NAME': 'connectdial_db',
+
+        'USER': 'gilly',
+
+        'PASSWORD': 'Iam1@Nitronitro',
+
+        'HOST': 'localhost',
+
+        'PORT': '5432',
+
+    }
+
+}
 # ======================
 # TEMPLATES
 # ======================
@@ -190,6 +202,14 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,        # ← Recommended
     'AUTH_HEADER_TYPES': ('Bearer',),
     'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+}
+
+# ======================
+# DJ-REST-AUTH (DRF Token)
+# ======================
+REST_AUTH = {
+    'USE_JWT': False,
+    'OLD_PASSWORD_FIELD_ENABLED': True,
 }
 
 SPECTACULAR_SETTINGS = {

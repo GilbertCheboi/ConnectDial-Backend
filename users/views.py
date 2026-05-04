@@ -842,6 +842,14 @@ class RegisterView(generics.CreateAPIView):
     serializer_class  = UserSerializer
     permission_classes = [AllowAny]
 
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        if response.status_code == 201:
+            user = User.objects.get(id=response.data['id'])
+            token, created = Token.objects.get_or_create(user=user)
+            response.data['token'] = token.key
+        return response
+
 
 class OnboardingView(APIView):
     authentication_classes = [TokenAuthentication]
