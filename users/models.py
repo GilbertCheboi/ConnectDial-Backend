@@ -118,6 +118,8 @@ class FanPreference(models.Model):
     team = models.ForeignKey(
         'leagues.Team', null=True, blank=True, on_delete=models.CASCADE
     )
+    followed_at = models.DateTimeField(auto_now_add=True)  # add this
+
 
     class Meta:
         unique_together = ('user', 'league')
