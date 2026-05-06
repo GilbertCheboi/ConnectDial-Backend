@@ -56,9 +56,10 @@ class ShortVideo(models.Model):
         on_delete=models.SET_NULL, related_name='short_videos',
     )
     team = models.ForeignKey(
-            'leagues.Team', null=True, blank=True, 
+            'leagues.Team', null=True, blank=True,
             on_delete=models.SET_NULL, related_name='short_videos'
         )
+
     # Duration in seconds — 0 to 7200 (2 hrs)
     duration    = models.PositiveIntegerField(
         default=0,
@@ -88,6 +89,14 @@ class ShortVideo(models.Model):
     @property
     def share_url(self):
         return f"https://connectdial.com/shorts/{self.pk}/"
+
+    @property
+    def og_title(self):
+        return f"{self.author.username}: {self.caption[:80]}" if self.caption else str(self.id)
+
+    @property
+    def og_description(self):
+        return self.caption[:200] if self.caption else ""
 
     @property
     def duration_display(self):
@@ -120,6 +129,10 @@ class VideoComment(models.Model):
     - `parent` allows one level of threaded replies.
     - `mentioned_users` is populated by parsing @username tokens in `body`
       (see signals.py) and stored in the CommentMention through-table.
+
+    NOTE: The DB column for `author` is `user_id` (legacy name from initial
+    migration). We keep the Python attribute as `author` for readability and
+    use db_column='user_id' to bridge the mismatch without a schema migration.
     """
     id      = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     video   = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='comments')
@@ -127,12 +140,13 @@ class VideoComment(models.Model):
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='video_comments',
+        db_column='user_id',   # ← actual column in short_videos_videocomment
     )
     parent  = models.ForeignKey(
         'self', null=True, blank=True,
         on_delete=models.CASCADE, related_name='replies',
     )
-    body    = models.TextField(max_length=1000)
+    body    = models.TextField(max_length=1000, db_column='text')
 
     # @mentioned users resolved at save time
     mentioned_users = models.ManyToManyField(
@@ -143,7 +157,6 @@ class VideoComment(models.Model):
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['created_at']
@@ -193,8 +206,15 @@ class VideoShare(models.Model):
 class VideoView(models.Model):
     """
     Records a single view event.
-    `watch_time` is seconds the user actually watched — used to compute
-    watch_ratio in the feed algorithm.
+
+    Fields
+    ──────
+    watch_time : seconds the user actually watched — used to compute
+                 watch_ratio in the feed algorithm.
+    completed  : True if the user watched to (or near) the end of the video.
+                 Computed automatically on save: watch_time >= 90% of duration.
+                 Stored explicitly so signals/analytics can filter on it cheaply
+                 without recomputing the ratio each time.
     """
     user        = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True,
@@ -202,6 +222,12 @@ class VideoView(models.Model):
     )
     video       = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='views')
     watch_time  = models.FloatField(default=0.0, help_text="Seconds watched.")
+
+    completed   = models.BooleanField(
+        default=False,
+        help_text="True if watch_time >= 90% of video duration.",
+    )
+
     created_at  = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -209,3 +235,16 @@ class VideoView(models.Model):
             models.Index(fields=['video', 'created_at']),
             models.Index(fields=['user', 'created_at']),
         ]
+
+    def save(self, *args, **kwargs):
+        """
+        Auto-compute `completed` before saving.
+        A view counts as completed if the user watched at least 90% of
+        the video. Falls back to False if duration is 0 (unknown length).
+        """
+        duration = self.video.duration if self.video_id else 0
+        if duration > 0:
+            self.completed = self.watch_time >= (duration * 0.9)
+        else:
+            self.completed = False
+        super().save(*args, **kwargs)

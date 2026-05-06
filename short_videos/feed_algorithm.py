@@ -34,7 +34,7 @@ from django.db.models import (
     Avg, F, ExpressionWrapper, FloatField,
     Case, When, Value, IntegerField,
 )
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Extract
 from django.utils import timezone
 from django.core.cache import cache
 
@@ -75,13 +75,27 @@ def _cache_key(user_id: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _user_interest_leagues(user) -> list:
-    """League IDs the user explicitly follows."""
-    return list(user.favorite_leagues.values_list('id', flat=True))
+    """
+    League IDs the user explicitly follows.
+    favorite_league is a ForeignKey (single object), not ManyToMany —
+    so we extract its pk directly and wrap in a list.
+    Returns an empty list if the field is not set (null/blank allowed).
+    """
+    if user.favorite_league_id:          # uses the DB column directly — no extra query
+        return [user.favorite_league_id]
+    return []
 
 
 def _user_interest_teams(user) -> list:
-    """Team IDs the user explicitly follows."""
-    return list(user.favorite_teams.values_list('id', flat=True))
+    """
+    Team IDs the user explicitly follows.
+    favorite_team is a ForeignKey (single object), not ManyToMany —
+    same pattern as _user_interest_leagues.
+    Returns an empty list if the field is not set (null/blank allowed).
+    """
+    if user.favorite_team_id:            # uses the DB column directly — no extra query
+        return [user.favorite_team_id]
+    return []
 
 
 def _user_history_leagues(user, limit: int = HISTORY_LIMIT) -> list:
@@ -130,11 +144,12 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     3. Annotate engagement metrics using cached counters (O(1) reads) and
        avg_watch from VideoView rows.
     4. Compute watch_ratio (normalised 0-1 across any video length).
-    5. Compute age_hours with a hard cap so very old videos aren't buried
-       below zero.
-    6. Annotate personalisation boosts.
-    7. Compute final score, order descending, slice to `limit`.
-    8. Store ordered UUID list in Redis and return queryset.
+    5. Compute age_hours via EXTRACT(EPOCH ...) / 3600 — works correctly
+       with PostgreSQL's interval type (no type-cast errors).
+    6. Cap age_hours at AGE_DECAY_CAP_HRS so very old videos aren't buried.
+    7. Annotate personalisation boosts.
+    8. Compute final score, order descending, slice to `limit`.
+    9. Store ordered UUID list in Redis and return queryset.
     """
     cache_key = _cache_key(user.pk)
 
@@ -183,16 +198,33 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         )
     )
 
-    # ── 5. Age in hours, capped at AGE_DECAY_CAP_HRS ────────────────────────
-    # Django timedelta arithmetic in the ORM yields microseconds as a float
-    # when cast to FloatField; dividing by 3_600_000_000 converts to hours.
-    # LEAST() equivalent via Case/When to cap the penalty.
+    # ── 5. Age in hours via EXTRACT(EPOCH FROM (now - created_at)) / 3600 ───
+    #
+    # FIX: The previous approach used Django timedelta division
+    #   (now - F('created_at')) / 3_600_000_000
+    # which produces a PostgreSQL `interval` type. Postgres cannot compare
+    # `interval > numeric` directly, raising:
+    #   ProgrammingError: operator does not exist: interval > numeric
+    #
+    # The correct approach is to use Extract('epoch') which calls
+    #   EXTRACT(EPOCH FROM (now - created_at))
+    # returning total seconds as a plain float, then divide by 3600 for hours.
+    # This is the standard PostgreSQL way to convert an interval to a number.
     qs = qs.annotate(
-        age_hours_raw=ExpressionWrapper(
-            (now - F('created_at')) / 3_600_000_000,
+        age_seconds=ExpressionWrapper(
+            Extract(now - F('created_at'), 'epoch'),
             output_field=FloatField(),
         )
     )
+    qs = qs.annotate(
+        age_hours_raw=ExpressionWrapper(
+            F('age_seconds') / 3600.0,
+            output_field=FloatField(),
+        )
+    )
+
+    # ── 6. Cap age at AGE_DECAY_CAP_HRS ─────────────────────────────────────
+    # Prevents very old videos from accumulating an unbounded negative penalty.
     qs = qs.annotate(
         age_hours=Case(
             When(age_hours_raw__gt=AGE_DECAY_CAP_HRS, then=Value(AGE_DECAY_CAP_HRS)),
@@ -201,8 +233,10 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         )
     )
 
-    # ── 6. Personalisation boosts ────────────────────────────────────────────
+    # ── 7. Personalisation boosts ────────────────────────────────────────────
     # Explicit follows carry higher weight than implicit watch-history signals.
+    # If explicit_leagues / explicit_teams is empty the Case falls through to
+    # default=0.0 cleanly — no SQL error from an empty __in list.
     qs = qs.annotate(
         explicit_league_boost=Case(
             When(league_id__in=explicit_leagues, then=Value(W_EXP_LEAGUE)),
@@ -234,7 +268,7 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         )
     )
 
-    # ── 7. Final score ───────────────────────────────────────────────────────
+    # ── 8. Final score ───────────────────────────────────────────────────────
     qs = qs.annotate(
         score=ExpressionWrapper(
             F('watch_ratio')    * W_WATCH_RATIO +
@@ -247,7 +281,7 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         )
     ).order_by('-score')
 
-    # ── 8. Slice, cache and return ───────────────────────────────────────────
+    # ── 9. Slice, cache and return ───────────────────────────────────────────
     result = qs[:limit]
 
     ids = [str(v.id) for v in result]   # evaluates the queryset once

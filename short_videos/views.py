@@ -4,37 +4,40 @@ ConnectDial — Views
 Endpoints
 ─────────
 Feed
-  GET  /api/shorts/feed/                   personalised short-video feed
+  GET  /api/videos/shorts/feed/                              personalised short-video feed
 
 Streaming
-  GET  /api/shorts/<pk>/stream/            HTTP Range-aware video stream
+  GET  /api/videos/shorts/<pk>/stream/                       HTTP Range-aware video stream
+  GET  /api/videos/shorts/<pk>/stream/?token=<drf_token>     token via query param for native players
 
 Engagement — Likes
-  POST   /api/shorts/<pk>/like/            toggle like on/off
-  DELETE /api/shorts/<pk>/like/            (same, both toggle)
+  POST   /api/videos/shorts/<pk>/like/                  toggle like on/off
 
 Engagement — Views
-  POST   /api/shorts/<pk>/view/            record a watch-time event
+  POST   /api/videos/shorts/<pk>/view/                  record a watch-time event
 
 Engagement — Shares
-  POST   /api/shorts/<pk>/share/           record a share event
+  POST   /api/videos/shorts/<pk>/share/                 record external share event
+  POST   /api/videos/shorts/<pk>/reshare/               in-app reshare
 
 Comments
-  GET    /api/shorts/<pk>/comments/        list top-level comments
-  POST   /api/shorts/<pk>/comments/        create a comment (supports @mentions)
-  GET    /api/shorts/<pk>/comments/<id>/replies/   list replies to a comment
-  PATCH  /api/comments/<id>/              edit own comment
-  DELETE /api/comments/<id>/              delete own comment
+  GET    /api/videos/shorts/<pk>/comments/              list top-level comments
+  POST   /api/videos/shorts/<pk>/comments/              create a comment
+  GET    /api/videos/shorts/<pk>/comments/<id>/replies/ list replies
+  PATCH  /api/videos/comments/<id>/                     edit own comment
+  DELETE /api/videos/comments/<id>/                     delete own comment
 """
 
-from django.db import IntegrityError
 from django.shortcuts import get_object_or_404
+from django.contrib.auth import get_user_model
 
 from rest_framework import status
-from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.authtoken.models import Token
 
 from .feed_algorithm import get_short_video_feed
 from .models import ShortVideo, VideoComment, VideoLike, VideoShare, VideoView
@@ -46,7 +49,13 @@ from .serializers import (
     VideoShareSerializer,
     VideoViewSerializer,
 )
-from .streaming import stream_video_response
+from .streaming import (
+    stream_video_response,
+    build_whatsapp_share_text,
+    build_telegram_share_text,
+)
+
+User = get_user_model()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,21 +64,22 @@ from .streaming import stream_video_response
 
 class ShortVideoFeedView(ListAPIView):
     """
-    Personalised short-video feed.
+    GET /api/videos/shorts/feed/
+
+    Personalised short-video feed — all videos come from our database.
+    Supports videos up to 2 hours (7200 seconds).
 
     Query params
     ────────────
     limit        : int (default 20, max 50)
     bypass_cache : any value → forces a fresh score computation
-
-    Content comes entirely from our database ranked by the feed algorithm.
-    No external video links (YouTube etc.) are served here.
     """
-    permission_classes = [IsAuthenticated]
-    serializer_class   = ShortVideoSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
+    serializer_class       = ShortVideoSerializer
 
     def get_queryset(self):
-        limit = min(int(self.request.query_params.get('limit', 20)), 50)
+        limit  = min(int(self.request.query_params.get('limit', 20)), 50)
         bypass = bool(self.request.query_params.get('bypass_cache', False))
         return get_short_video_feed(self.request.user, limit=limit, bypass_cache=bypass)
 
@@ -85,43 +95,97 @@ class ShortVideoFeedView(ListAPIView):
 
 class ShortVideoStreamView(APIView):
     """
+    GET /api/videos/shorts/<pk>/stream/
+    GET /api/videos/shorts/<pk>/stream/?token=<drf_token_key>
+
     HTTP Range-aware video streaming.
-    Supports seeking, progressive playback and resume on reconnect.
-    In production, redirects to a pre-signed S3/GCS URL (see streaming.py).
+    Supports seeking, progressive playback, and resume after network drops.
+
+    Authentication
+    ──────────────
+    Standard: Authorization: Token <key> header (handled by TokenAuthentication).
+
+    Query-param fallback: ?token=<key>
+    react-native-video cannot attach custom headers to a video src URL.
+    If no Authorization header is present, we manually look up the token from
+    the query param and authenticate the user that way.
+
+    IMPORTANT: permission_classes is intentionally empty here. DRF's permission
+    check runs before our view code, so we cannot use IsAuthenticated — it would
+    reject ?token= requests before our fallback logic runs. Authentication is
+    enforced manually at the bottom of this method instead.
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = []   # Auth enforced manually below — see docstring
 
     def get(self, request, pk):
+        user = request.user
+
+        # ── Query-param token fallback for react-native-video ─────────────
+        # If DRF's TokenAuthentication didn't resolve a user from the
+        # Authorization header, try the ?token= query param.
+        if not user or not user.is_authenticated:
+            token_key = request.query_params.get('token', '').strip()
+            if token_key:
+                try:
+                    token_obj = Token.objects.select_related('user').get(key=token_key)
+                    user = token_obj.user
+                except Token.DoesNotExist:
+                    return Response(
+                        {'detail': 'Invalid or expired token.'},
+                        status=status.HTTP_401_UNAUTHORIZED,
+                    )
+
+        # ── Final auth gate ───────────────────────────────────────────────
+        if not user or not user.is_authenticated:
+            return Response(
+                {'detail': 'Authentication credentials were not provided.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
         video = get_object_or_404(ShortVideo, pk=pk)
         return stream_video_response(request, video)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIKES  (toggle)
+# LIKES (toggle)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VideoLikeToggleView(APIView):
     """
-    POST or DELETE → toggles a like on the given video.
-    Returns 201 when liked, 204 when unliked.
+    POST /api/videos/shorts/<pk>/like/
+    Toggles like. Returns { liked, likes_count }.
     The cached_likes counter is kept in sync by signals.py.
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request, pk):
         video = get_object_or_404(ShortVideo, pk=pk)
         like, created = VideoLike.objects.get_or_create(user=request.user, video=video)
         if created:
-            return Response({'liked': True}, status=status.HTTP_201_CREATED)
-        # Already liked — treat as unlike toggle
+            video.refresh_from_db(fields=['cached_likes'])
+            return Response(
+                {'liked': True, 'likes_count': video.cached_likes},
+                status=status.HTTP_201_CREATED,
+            )
+        # Already liked — toggle off
         like.delete()
-        return Response({'liked': False}, status=status.HTTP_200_OK)
+        video.refresh_from_db(fields=['cached_likes'])
+        return Response(
+            {'liked': False, 'likes_count': video.cached_likes},
+            status=status.HTTP_200_OK,
+        )
 
     def delete(self, request, pk):
         video = get_object_or_404(ShortVideo, pk=pk)
         deleted, _ = VideoLike.objects.filter(user=request.user, video=video).delete()
+        video.refresh_from_db(fields=['cached_likes'])
         if deleted:
-            return Response({'liked': False}, status=status.HTTP_204_NO_CONTENT)
+            return Response(
+                {'liked': False, 'likes_count': video.cached_likes},
+                status=status.HTTP_204_NO_CONTENT,
+            )
         return Response({'detail': 'Not liked.'}, status=status.HTTP_404_NOT_FOUND)
 
 
@@ -131,52 +195,115 @@ class VideoLikeToggleView(APIView):
 
 class VideoViewRecordView(APIView):
     """
-    POST body: { "watch_time": <seconds_float> }
-    Records one view event.  The player should call this when the user
-    leaves / pauses / completes the video.
+    POST /api/videos/shorts/<pk>/view/
+    Body: { "watch_time": <seconds_float> }
+
+    Records one view event. The player calls this when the user leaves,
+    pauses, or completes the video. Supports watch_time up to 7200s (2 hrs).
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request, pk):
         video = get_object_or_404(ShortVideo, pk=pk)
-        serializer = VideoViewSerializer(data={**request.data, 'video': video.pk})
+        serializer = VideoViewSerializer(
+            data={**request.data, 'video': str(video.pk)}
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save(user=request.user)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARES
+# SHARES — external
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VideoShareRecordView(APIView):
     """
-    POST body: { "platform": "whatsapp" }  (see VideoShare.PLATFORM_CHOICES)
-    Records a share event and returns the appropriate share text.
+    POST /api/videos/shorts/<pk>/share/
+    Body: { "platform": "whatsapp" }  (see VideoShare.PLATFORM_CHOICES)
+    Records a share event and returns the platform-specific share payload.
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
 
     def post(self, request, pk):
-        from .streaming import build_whatsapp_share_text, build_telegram_share_text
-
         video = get_object_or_404(ShortVideo, pk=pk)
-        serializer = VideoShareSerializer(data={**request.data, 'video': video.pk})
+        serializer = VideoShareSerializer(
+            data={**request.data, 'video': str(video.pk)}
+        )
         serializer.is_valid(raise_exception=True)
         share = serializer.save(user=request.user)
 
-        # Build share text for the client
         platform = share.platform
-        if platform == 'whatsapp':
-            share_text = build_whatsapp_share_text(video)
-        elif platform == 'telegram':
-            share_text = build_telegram_share_text(video)
-        else:
-            share_text = video.share_url
+        payload  = {
+            **serializer.data,
+            'share_url':      video.share_url,
+            'og_title':       video.og_title,
+            'og_description': video.og_description,
+            'thumbnail_url': (
+                request.build_absolute_uri(video.thumbnail.url)
+                if video.thumbnail else None
+            ),
+        }
 
-        return Response(
-            {**serializer.data, 'share_text': share_text},
-            status=status.HTTP_201_CREATED,
+        if platform == 'whatsapp':
+            text = build_whatsapp_share_text(video)
+            payload['text']         = text
+            payload['whatsapp_url'] = f"https://wa.me/?text={text}"
+
+        elif platform == 'telegram':
+            text = build_telegram_share_text(video)
+            payload['text']         = text
+            payload['telegram_url'] = (
+                f"https://t.me/share/url?url={video.share_url}"
+                f"&text={video.og_title}"
+            )
+
+        elif platform == 'twitter':
+            payload['twitter_url'] = (
+                f"https://twitter.com/intent/tweet"
+                f"?url={video.share_url}&text={video.og_title}"
+            )
+
+        else:
+            payload['share_text'] = video.share_url
+
+        return Response(payload, status=status.HTTP_201_CREATED)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESHARE — in-app
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VideoReshareView(APIView):
+    """
+    POST /api/videos/shorts/<pk>/reshare/
+    In-app reshare — appears on the resharer's profile feed.
+    Calling again undoes the reshare (toggle).
+    """
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request, pk):
+        video = get_object_or_404(ShortVideo, pk=pk)
+
+        existing = VideoShare.objects.filter(
+            user=request.user,
+            video=video,
+            platform='other',
+        ).first()
+
+        if existing:
+            existing.delete()
+            return Response({'reshared': False}, status=status.HTTP_200_OK)
+
+        VideoShare.objects.create(
+            user=request.user,
+            video=video,
+            platform='other',
         )
+        return Response({'reshared': True}, status=status.HTTP_201_CREATED)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,38 +312,28 @@ class VideoShareRecordView(APIView):
 
 class VideoCommentListCreateView(APIView):
     """
-    GET  → list top-level comments for a video (paginated, oldest first).
-    POST → create a new comment or reply.
+    GET  /api/videos/shorts/<pk>/comments/   list top-level comments
+    POST /api/videos/shorts/<pk>/comments/   create a comment
 
-    Creating a comment
-    ──────────────────
     Body fields:
       body    (required) : comment text, may include @username tokens
       parent  (optional) : UUID of the comment being replied to
-
-    @mention resolution
-    ───────────────────
-    @username tokens in `body` are automatically resolved to real users by
-    the `comment_saved` signal in signals.py.  The client does NOT need to
-    pass a separate list of user IDs.
-
-    Example body:
-      "Great goal @john.doe! @jane_smith what do you think?"
-
-    Both @john.doe and @jane_smith will receive a notification if they exist.
     """
-    permission_classes = [IsAuthenticatedOrReadOnly]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticatedOrReadOnly]
 
     def get(self, request, pk):
         video    = get_object_or_404(ShortVideo, pk=pk)
         comments = (
             VideoComment.objects
-            .filter(video=video, parent__isnull=True)   # top-level only
-            .select_related('author')
+            .filter(video=video, parent__isnull=True)
+            .select_related('author')           # 'author' is the Python attr; db_column='user_id'
             .prefetch_related('mentions__user', 'replies')
             .order_by('created_at')
         )
-        serializer = VideoCommentSerializer(comments, many=True, context={'request': request})
+        serializer = VideoCommentSerializer(
+            comments, many=True, context={'request': request}
+        )
         return Response(serializer.data)
 
     def post(self, request, pk):
@@ -226,23 +343,21 @@ class VideoCommentListCreateView(APIView):
             context={'request': request},
         )
         serializer.is_valid(raise_exception=True)
-        comment = serializer.save(author=request.user)
+        comment = serializer.save(author=request.user)  # passes as FK kwarg → user_id col
 
-        # Return the full read representation including resolved mentions
         read_serializer = VideoCommentSerializer(
-            comment,
-            context={'request': request},
+            comment, context={'request': request}
         )
         return Response(read_serializer.data, status=status.HTTP_201_CREATED)
 
 
 class CommentRepliesListView(ListAPIView):
     """
-    GET /api/shorts/<pk>/comments/<comment_id>/replies/
-    Lists direct replies to a specific comment.
+    GET /api/videos/shorts/<pk>/comments/<comment_pk>/replies/
     """
-    permission_classes    = [IsAuthenticatedOrReadOnly]
-    serializer_class      = VideoCommentSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticatedOrReadOnly]
+    serializer_class       = VideoCommentSerializer
 
     def get_queryset(self):
         video_pk   = self.kwargs['pk']
@@ -258,13 +373,15 @@ class CommentRepliesListView(ListAPIView):
 
 class CommentDetailView(APIView):
     """
-    PATCH  /api/comments/<pk>/   — edit own comment (updates @mentions too)
-    DELETE /api/comments/<pk>/   — delete own comment
+    PATCH  /api/videos/comments/<pk>/  — edit own comment
+    DELETE /api/videos/comments/<pk>/  — delete own comment
     """
-    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
 
     def _get_own_comment(self, request, pk):
         comment = get_object_or_404(VideoComment, pk=pk)
+        # author_id resolves to the user_id column via db_column
         if comment.author_id != request.user.pk:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You can only edit or delete your own comments.")
@@ -273,14 +390,11 @@ class CommentDetailView(APIView):
     def patch(self, request, pk):
         comment    = self._get_own_comment(request, pk)
         serializer = VideoCommentCreateSerializer(
-            comment,
-            data=request.data,
-            partial=True,
+            comment, data=request.data, partial=True,
             context={'request': request},
         )
         serializer.is_valid(raise_exception=True)
         updated = serializer.save()
-
         read_serializer = VideoCommentSerializer(updated, context={'request': request})
         return Response(read_serializer.data)
 
