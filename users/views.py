@@ -705,54 +705,74 @@ class CheckTokenView(APIView):
 # ─────────────────────────────────────────────
 # GOOGLE SIGN-IN (DRF Token)
 # ─────────────────────────────────────────────
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 
 class GoogleSignInView(APIView):
     """POST /auth/social/google/ — Body: { "id_token": "..." }"""
     permission_classes = [AllowAny]
-    throttle_classes   = [LoginThrottle]
+    throttle_classes = [LoginThrottle]
 
     def post(self, request):
         raw_token = request.data.get('id_token', '').strip()
         if not raw_token:
             return Response({'error': 'id_token is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
+        client_id = settings.GOOGLE_CLIENT_ID  # or from SOCIALACCOUNT_PROVIDERS
 
         try:
+            # Verify the token
             idinfo = google_id_token.verify_oauth2_token(
-                raw_token, google_requests.Request(), client_id
+                raw_token,
+                google_requests.Request(),
+                client_id
             )
-        except ValueError:
-            return Response({'error': 'Invalid Google token.'}, status=status.HTTP_401_UNAUTHORIZED)
 
-        email = idinfo.get('email')
-        if not email or not idinfo.get('email_verified', False):
-            return Response({'error': 'Invalid or unverified Google email.'}, status=status.HTTP_400_BAD_REQUEST)
+            # Extra validation
+            if idinfo.get('aud') != client_id and idinfo.get('azp') != client_id:
+                return Response({'error': 'Token audience mismatch'}, status=401)
 
-        try:
-            user    = User.objects.get(email__iexact=email)
-            created = False
-        except User.DoesNotExist:
-            username = _make_unique_username(email.split('@')[0])
-            user = User.objects.create_user(
-                username=username, email=email,
-                first_name=idinfo.get('given_name', ''),
-                last_name=idinfo.get('family_name', ''),
+            email = idinfo.get('email')
+            if not email or not idinfo.get('email_verified'):
+                return Response({'error': 'Email not verified by Google'}, status=400)
+
+            # Create or get user
+            try:
+                user = User.objects.get(email__iexact=email)
+                created = False
+            except User.DoesNotExist:
+                username = _make_unique_username(email.split('@')[0])
+                user = User.objects.create_user(
+                    username=username,
+                    email=email,
+                    first_name=idinfo.get('given_name', ''),
+                    last_name=idinfo.get('family_name', ''),
+                )
+                created = True
+            except User.MultipleObjectsReturned:
+                user = User.objects.filter(email__iexact=email).order_by('-date_joined').first()
+                created = False
+
+            # Link social account
+            SocialAccount.objects.get_or_create(
+                user=user,
+                provider='google',
+                uid=idinfo['sub']
             )
-            created = True
-        except User.MultipleObjectsReturned:
-            user    = User.objects.filter(email__iexact=email).order_by('-date_joined').first()
-            created = False
 
-        SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
-        _log_login(user, request)
+            _log_login(user, request)
 
-        return Response(
-            _token_response(user, {'is_new_user': created}),
-            status=status.HTTP_200_OK,
-        )
+            return Response(
+                _token_response(user, {'is_new_user': created}),
+                status=status.HTTP_200_OK
+            )
 
-
+        except ValueError as e:
+            print(f"Google token verification failed: {str(e)}")
+            return Response({
+                'error': 'Invalid Google ID token',
+                'detail': str(e)
+            }, status=status.HTTP_401_UNAUTHORIZED)
 # ─────────────────────────────────────────────
 # FOLLOW / UNFOLLOW
 # ─────────────────────────────────────────────
@@ -914,3 +934,28 @@ class LogoutView(APIView):
             request.user.auth_token.delete()
 
         return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)
+    
+    
+# In views.py — temporary test view
+class TestGoogleTokenView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        token = request.data.get('id_token')
+        if not token:
+            return Response({"error": "No token"}, status=400)
+
+        try:
+            idinfo = google_id_token.verify_oauth2_token(
+                token, 
+                google_requests.Request(), 
+                settings.GOOGLE_CLIENT_ID
+            )
+            return Response({
+                "valid": True,
+                "email": idinfo.get('email'),
+                "name": idinfo.get('name'),
+                "aud": idinfo.get('aud')
+            })
+        except Exception as e:
+            return Response({"valid": False, "error": str(e)}, status=400)

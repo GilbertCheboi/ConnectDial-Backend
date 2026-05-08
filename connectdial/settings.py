@@ -18,7 +18,7 @@ DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = [
     '192.168.100.107', 'localhost', '127.0.0.1', '0.0.0.0',
-    '10.126.232.156', '192.168.100.108', '10.199.198.201', '10.199.198.22','192.168.100.107'
+    '10.126.232.156', '192.168.100.108', '10.199.198.201', '10.199.198.22',
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -85,9 +85,9 @@ DATABASES = {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'connectdial_db',
         'USER': 'gilly',
-        'PASSWORD': 'Iam1@Nitronitro',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),   # ← move to .env, never hardcode
+        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'PORT': os.getenv('DB_PORT', '5432'),
     }
 }
 
@@ -134,25 +134,37 @@ GS_CONNECTION_TIMEOUT = 300
 GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB
 
 # ======================
-# CORS (⚠️ Change before production!)
+# CORS
+# ⚠️  Lock this down before going to production:
+#     CORS_ALLOW_ALL_ORIGINS = False
+#     CORS_ALLOWED_ORIGINS = ["https://yourapp.com"]
 # ======================
-CORS_ALLOW_ALL_ORIGINS = True  # ← Security risk in production
+CORS_ALLOW_ALL_ORIGINS = True
 
 # ======================
-# AUTHENTICATION
+# AUTHENTICATION BACKENDS
 # ======================
-AUTHENTICATION_BACKENDS = (
+AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',
-)
+]
 
-# Allauth settings
-ACCOUNT_EMAIL_VERIFICATION = 'none'
+# ======================
+# ALLAUTH — headless / API mode
+# Your GoogleSignInView bypasses the allauth OAuth redirect entirely and
+# validates the id_token directly with google-auth. These settings keep
+# allauth happy for account management while staying out of the way for
+# social login.
+# ======================
+ACCOUNT_EMAIL_VERIFICATION = 'none'          # OTP-based verification is handled manually
 ACCOUNT_AUTHENTICATION_METHOD = 'email'
 ACCOUNT_EMAIL_REQUIRED = True
 ACCOUNT_UNIQUE_EMAIL = True
+
 SOCIALACCOUNT_AUTO_SIGNUP = True
-SOCIALACCOUNT_LOGIN_ON_GET = True
+SOCIALACCOUNT_EMAIL_REQUIRED = False         # Google already verified the email
+SOCIALACCOUNT_EMAIL_AUTHENTICATION = False   # No extra allauth email step
+# SOCIALACCOUNT_LOGIN_ON_GET removed — deprecated and a security risk
 
 SOCIALACCOUNT_PROVIDERS = {
     'google': {
@@ -164,6 +176,8 @@ SOCIALACCOUNT_PROVIDERS = {
         'SCOPE': ['profile', 'email'],
         'AUTH_PARAMS': {'access_type': 'online'},
         'FETCH_USERINFO': True,
+        # Trust Google's own email verification — no need to re-verify
+        'VERIFIED_EMAIL': True,
     }
 }
 
@@ -172,7 +186,7 @@ SOCIALACCOUNT_PROVIDERS = {
 # ======================
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.TokenAuthentication',  # ← DRF Token Auth
+        'rest_framework.authentication.TokenAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
@@ -180,7 +194,13 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
     'DEFAULT_THROTTLE_RATES': {
+        'anon': '60/min',
+        'user': '300/min',
         'login': '10/min',
         'otp': '5/min',
         'password_reset': '5/min',
@@ -194,6 +214,7 @@ REST_AUTH = {
     'USE_JWT': False,
     'TOKEN_MODEL': 'rest_framework.authtoken.models.Token',
     'OLD_PASSWORD_FIELD_ENABLED': True,
+    'REGISTER_SERIALIZER': 'dj_rest_auth.registration.serializers.RegisterSerializer',
 }
 
 # ======================
@@ -353,13 +374,29 @@ NEWS_API_KEY = os.getenv('NEWS_API_KEY')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
 # ======================
+# GOOGLE AUTH (used by GoogleSignInView in views.py)
+# The mobile app sends an id_token from Google Sign-In SDK.
+# GoogleSignInView verifies it directly with google-auth — no redirect needed.
+# GOOGLE_CLIENT_ID must exactly match the OAuth client used in your mobile app.
+# ======================
+GOOGLE_CLIENT_ID = os.getenv('GOOGLE_CLIENT_ID')
+
+# ======================
 # OTP SETTINGS
 # ======================
 OTP_EXPIRY_SECONDS = 300
 OTP_MAX_ATTEMPTS = 5
 OTP_RESEND_COOLDOWN = 30
-# 1 = single ALB, 2 = CloudFront + ALB, 0 = no proxy
-TRUSTED_PROXY_COUNT = 1
 
+# ======================
+# PROXY / AWS CONFIG
+# 1 = single ALB, 2 = CloudFront + ALB, 0 = no proxy
+# ======================
+TRUSTED_PROXY_COUNT = 1
 USE_X_FORWARDED_HOST = True
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# ======================
+# APP NAME (used in 2FA QR code issuer label)
+# ======================
+APP_NAME = 'ConnectDial'
