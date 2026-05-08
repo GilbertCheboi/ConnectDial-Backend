@@ -15,6 +15,7 @@ Includes:
   - Custom Login (DRF Token)
   - Register, Onboard, Profile CRUD
   - Audit logging & login history
+  - AWS/proxy-aware IP retrieval (ALB, CloudFront, Nginx)
 """
 
 import random
@@ -87,6 +88,69 @@ class PasswordResetThrottle(AnonRateThrottle):
 
 
 # ─────────────────────────────────────────────
+# IP RETRIEVAL — AWS / PROXY AWARE
+# ─────────────────────────────────────────────
+#
+# How AWS ALB works:
+#   X-Forwarded-For: <real-client>, <proxy1>, ..., <ALB-ip>
+#   The real client IP is the LEFTMOST entry when TRUSTED_PROXY_COUNT = 1.
+#
+# How CloudFront + ALB works:
+#   X-Forwarded-For: <real-client>, <cloudfront-edge>, <ALB-ip>
+#   Set TRUSTED_PROXY_COUNT = 2 in settings.py for this topology.
+#
+# Configure in settings.py:
+#   TRUSTED_PROXY_COUNT = 1   # single ALB
+#   TRUSTED_PROXY_COUNT = 2   # CloudFront + ALB
+#   TRUSTED_PROXY_COUNT = 0   # no proxy, use REMOTE_ADDR directly
+#
+# Also recommended in settings.py for HTTPS behind ALB:
+#   USE_X_FORWARDED_HOST = True
+#   SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+# ─────────────────────────────────────────────
+
+# Read trusted proxy count from settings; default to 1 (single ALB)
+_TRUSTED_PROXY_COUNT = getattr(settings, "TRUSTED_PROXY_COUNT", 1)
+
+
+def _get_client_ip(request) -> str:
+    """
+    Extract the real client IP address in a proxy/AWS-aware manner.
+
+    Strategy:
+      1. Read X-Forwarded-For header if present.
+      2. Build the full IP chain (leftmost = original client).
+      3. Walk right-to-left, skipping one IP per trusted proxy hop.
+      4. Return the first IP that is NOT a trusted proxy.
+      5. Fall back to REMOTE_ADDR if no XFF header is present.
+
+    This correctly handles:
+      - AWS ALB (appends its own IP to XFF)
+      - CloudFront + ALB (two trusted hops)
+      - Plain Nginx reverse proxy
+      - Direct connections (no proxy)
+      - Spoofed XFF headers (ignored beyond trusted proxy count)
+
+    Returns an empty string rather than raising an exception so that
+    IP logging never crashes a real auth request.
+    """
+    xff = request.META.get("HTTP_X_FORWARDED_FOR", "").strip()
+
+    if xff:
+        # Split, strip whitespace, drop empty segments
+        ip_chain = [segment.strip() for segment in xff.split(",") if segment.strip()]
+
+        if ip_chain:
+            # The real client IP sits at index = len(chain) - trusted_proxies - 1
+            # e.g. chain = [client, alb]  →  idx = 2 - 1 - 1 = 0  →  client ✓
+            idx = max(0, len(ip_chain) - _TRUSTED_PROXY_COUNT - 1)
+            return ip_chain[idx]
+
+    # No XFF header — direct connection or proxy stripped the header
+    return request.META.get("REMOTE_ADDR", "")
+
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
@@ -132,7 +196,7 @@ def _issue_signed_reset_token(user) -> str:
     timestamp = int(timezone.now().timestamp())
     payload   = f"{user.id}:{timestamp}".encode()
     secret    = settings.SECRET_KEY.encode()
-    signature = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()  # ← fixed
+    signature = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()
     return f"{user.id}:{timestamp}:{signature}"
 
 
@@ -149,7 +213,7 @@ def _decode_signed_reset_token(raw_token: str):
         user_id, timestamp, signature = parts
         payload      = f"{user_id}:{timestamp}".encode()
         secret       = settings.SECRET_KEY.encode()
-        expected_sig = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()  # ← fixed
+        expected_sig = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected_sig, signature):
             raise ValueError("Invalid token signature.")
@@ -199,9 +263,11 @@ def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = Non
 
 
 def _log_login(user, request):
-    """Log successful login with IP & device."""
-    ip     = request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip() \
-             or request.META.get("REMOTE_ADDR")
+    """
+    Log a successful login event with the real client IP and device info.
+    Uses _get_client_ip() which is AWS ALB / CloudFront aware.
+    """
+    ip     = _get_client_ip(request)
     device = request.META.get("HTTP_USER_AGENT", "Unknown Device")
 
     try:
@@ -248,7 +314,7 @@ class SendEmailVerificationView(APIView):
     permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        user    = request.user
+        user       = request.user
         profile, _ = Profile.objects.get_or_create(user=user)
 
         if profile.email_verified:
@@ -372,8 +438,9 @@ class VerifyOTPView(APIView):
             return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
         otp_obj.delete()
-        ip = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() \
-             or request.META.get('REMOTE_ADDR')
+
+        # Single consistent IP extraction for all OTP outcomes
+        ip = _get_client_ip(request)
 
         if purpose == 'password_reset':
             reset_token = _issue_signed_reset_token(user)
@@ -462,8 +529,7 @@ class ResetPasswordView(APIView):
         user.save()
         Token.objects.filter(user=user).delete()
 
-        ip = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() \
-             or request.META.get('REMOTE_ADDR')
+        ip = _get_client_ip(request)
         _log_audit(user, 'password_reset_completed', ip)
 
         return Response(

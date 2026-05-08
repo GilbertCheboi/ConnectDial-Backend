@@ -114,7 +114,7 @@ TEMPLATES = [
 # ======================
 STATIC_URL = 'static/'
 
-GS_BUCKET_NAME = 'connectdial-bb223.firebasestorage.app'
+GS_BUCKET_NAME = 'connect-c894b.firebasestorage.app'
 GS_KEY_PATH = os.path.join(BASE_DIR, 'firebase-service-account.json')
 
 if os.path.exists(GS_KEY_PATH):
@@ -358,3 +358,8 @@ YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 OTP_EXPIRY_SECONDS = 300
 OTP_MAX_ATTEMPTS = 5
 OTP_RESEND_COOLDOWN = 30
+# 1 = single ALB, 2 = CloudFront + ALB, 0 = no proxy
+TRUSTED_PROXY_COUNT = 1
+
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
