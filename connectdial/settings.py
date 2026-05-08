@@ -363,3 +363,30 @@ TRUSTED_PROXY_COUNT = 1
 
 USE_X_FORWARDED_HOST = True
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+# AWS / Proxy settings
+TRUSTED_PROXY_COUNT = 1
+USE_X_FORWARDED_HOST = True
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+
+# Redis Cache (throttling & sessions)
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+    }
+}
+
+# Authentication backends
+AUTHENTICATION_BACKENDS = [
+    'django.contrib.auth.backends.ModelBackend',
+    'allauth.account.auth_backends.AuthenticationBackend',
+]
+
+# CSRF trusted origins
+CSRF_TRUSTED_ORIGINS = [
+    'https://api.connectdial.com',
+    'http://api.connectdial.com',
+    'https://16.16.98.131',
+    'http://16.16.98.131',
+]

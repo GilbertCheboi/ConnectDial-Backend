@@ -5,11 +5,19 @@ from celery import shared_task
 from django.conf import settings
 from django.contrib.auth import get_user_model
 
-# Ensure Firebase is only initialized once
-if not firebase_admin._apps:
-    cred_path = os.path.join(settings.BASE_DIR, 'firebase-service-account.json')
-    cred = credentials.Certificate(cred_path)
-    firebase_admin.initialize_app(cred)
+# ================== FIREBASE INITIALIZATION ==================
+cred_path = os.path.join(settings.BASE_DIR, 'firebase-service-account.json')
+
+try:
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK initialized successfully on server")
+    else:
+        print("⚠️ Firebase service account not found")
+except Exception as e:
+    print(f"❌ Firebase initialization failed: {e}")
+# ============================================================
 
 User = get_user_model()
 

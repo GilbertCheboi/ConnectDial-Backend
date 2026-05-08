@@ -247,7 +247,13 @@ def _get_user_by_identifier(identifier: str):
     )
     return qs.order_by('-date_joined').first() if qs.exists() else None
 
+def _log_audit(user, action, ip, details=None):
+    """Log an audit event with a clean IP address."""
+    # 1. Clean the IP (Fixes the DataError)
+    if ip and isinstance(ip, str) and ',' in ip:
+        ip = ip.split(',')[0].strip()
 
+<<<<<<< Updated upstream
 def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = None):
     """Centralized audit logging — silently skips unknown action values."""
     try:
@@ -280,6 +286,32 @@ def _log_login(user, request):
     except Exception:
         pass  # Never let login history crash a real request
 
+=======
+    # 2. Fix the TypeError: Remove 'details' if it's not in your model
+    return AuditLog.objects.create(
+        user=user,
+        action=action,
+        ip_address=ip
+        # removed details=details because it doesn't exist in your model
+    )
+def _log_login(user, request):
+    """Log successful login with IP & device."""
+    # Handle comma-separated IP lists from proxies like Cloudflare/Nginx
+    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if x_forwarded_for:
+        ip = x_forwarded_for.split(",")[0].strip()
+    else:
+        ip = request.META.get("REMOTE_ADDR")
+
+    device = request.META.get("HTTP_USER_AGENT", "Unknown Device")
+    
+    LoginHistory.objects.create(
+        user=user,
+        ip_address=ip,
+        device_info=device,
+        success=True,
+    )
+>>>>>>> Stashed changes
     _log_audit(user, "login_success", ip, device)
 
 
@@ -439,9 +471,20 @@ class VerifyOTPView(APIView):
 
         otp_obj.delete()
 
+<<<<<<< Updated upstream
         # Single consistent IP extraction for all OTP outcomes
         ip = _get_client_ip(request)
 
+=======
+        # FIXED: Handle Cloudflare/Proxy comma-separated IP lists
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0].strip()
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+
+        # ── Purpose-specific responses ──────────────────────────────────────
+>>>>>>> Stashed changes
         if purpose == 'password_reset':
             reset_token = _issue_signed_reset_token(user)
             _log_audit(user, 'password_reset_otp_verified', ip)
@@ -879,7 +922,10 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
 # ─────────────────────────────────────────────
 # CUSTOM LOGIN (DRF Token)
 # ─────────────────────────────────────────────
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
 
+@method_decorator(csrf_exempt, name='dispatch')
 class CustomLoginView(LoginView):
     serializer_class = CustomLoginSerializer
 
