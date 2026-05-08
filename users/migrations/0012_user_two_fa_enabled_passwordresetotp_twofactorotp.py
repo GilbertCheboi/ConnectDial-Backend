@@ -9,7 +9,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('users', '0011_alter_fanpreference_id_alter_follow_id_and_more'),
+	    ('users', '0002_drop_user_two_fa_enabled'),
     ]
 
     operations = [

@@ -258,40 +258,75 @@ from posts.serializers import PostSerializer
 
 # posts/views.py
 from .services import get_personalized_shorts
-
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Exclusively serves natively uploaded 'Shorts'.
+    Filters out YouTube links and non-ready video uploads.
+    """
     serializer_class = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         user = self.request.user
         
-        # 1. Basic filtering for video content
-        queryset = Post.objects.filter(is_short=True).filter(
-            Q(media_file__icontains='.mp4') | 
-            Q(content__icontains='youtube.com') | 
-            Q(content__icontains='youtu.be')
-        )
+        # ✅ Filter 1: Only native uploads (Post media) + Video must be 'ready'
+        # This excludes YouTube strings used in your previous version.
+        queryset = Post.objects.filter(
+            is_short=True,
+            video_status='ready' 
+        ).exclude(media_file='')
 
-        # 2. League filtering
+        # ✅ Filter 2: League Personalization
         followed_league_ids = user.fan_preferences.values_list('league_id', flat=True)
         if followed_league_ids.exists():
             queryset = queryset.filter(league_id__in=followed_league_ids)
 
-        # 3. Optimization
+        # ✅ Step 3: Optimization & Personalized Algorithm
         queryset = queryset.select_related('author', 'league', 'team').prefetch_related('hashtags')
+        queryset = get_personalized_shorts(queryset) #
 
-        # 4. Inject the Algorithm Math 🚀
-        # This function handles the .order_by('-hot_score') for you!
-        queryset = get_personalized_shorts(queryset)
-
-        # 5. User-specific "Liked" context
+        # ✅ Step 4: Engagement Context
         user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-        
-        # ✅ REMOVED the .order_by('-created_at') here to keep the Hot Score ranking
         return queryset.annotate(user_has_liked=Exists(user_likes))
+    
+# video_upload_views.py
+import os
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Post, VideoUploadSession
 
+class VideoUploadFinalizeView(APIView):
+    """
+    Step 3: Assemble chunks and trigger editing/trimming tasks.
+    """
+    permission_classes = [permissions.IsAuthenticated]
 
+    def post(self, request):
+        upload_id = request.data.get('upload_id')
+        song_id = request.data.get('song_id') # User selected song
+        trim_start = request.data.get('trim_start', 0)
+        trim_end = request.data.get('trim_end', None)
+
+        session = VideoUploadSession.objects.get(id=upload_id, user=request.user)
+        
+        # 1. Mark as processing
+        session.post.video_status = 'processing'
+        session.post.save()
+
+        # 2. Trigger Celery Task for FFmpeg editing
+        # This is where 'trim' and 'add music' actually happens on the server
+        from .tasks import process_video_upload
+        process_video_upload.delay(
+            post_id=session.post.id,
+            song_id=song_id,
+            trim_range=(trim_start, trim_end)
+        )
+
+        return Response({
+            "status": "processing",
+            "message": "Video is being edited and optimized."
+        }, status=status.HTTP_202_ACCEPTED)
 class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = Post.objects.all()
     serializer_class = PostSerializer
@@ -384,37 +419,3 @@ class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data)
 
 
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from .models import Post, VideoEngagement
-
-class RecordEngagementView(APIView):
-    """
-    Endpoint called by React Native when a user finishes watching a video
-    or swipes away.
-    """
-    def post(self, request):
-        post_id = request.data.get('post_id')
-        watch_time = request.data.get('watch_time') # In seconds
-        completed = request.data.get('completed', False)
-        
-        try:
-            post = Post.objects.get(id=post_id)
-            
-            # 1. Create the engagement record for the algorithm
-            VideoEngagement.objects.create(
-                user=request.user if request.user.is_authenticated else None,
-                post=post,
-                watch_time=watch_time,
-                is_completed=completed,
-                league_id=post.league.id # Helping the 'Interest Link'
-            )
-            
-            # 2. Update the main counter on the Post for the Hot Score
-            post.view_count += 1
-            post.save(update_fields=['view_count'])
-            
-            return Response({"status": "success"}, status=status.HTTP_201_CREATED)
-        except Post.DoesNotExist:
-            return Response({"error": "Post not found"}, status=status.HTTP_404_NOT_FOUND)

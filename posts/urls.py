@@ -5,7 +5,7 @@ from .views import (
     CommentViewSet, 
     ShortVideoViewSet, 
     HashtagViewSet, 
-    RecordEngagementView
+    
 )
 
 router = DefaultRouter()
@@ -20,6 +20,5 @@ router.register(r'', PostViewSet, basename='post')
 
 urlpatterns = [
     # APIView goes here
-    path('engagements/record/', RecordEngagementView.as_view(), name='record-engagement'),
     path('', include(router.urls)),
 ]
