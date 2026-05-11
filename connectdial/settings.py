@@ -5,7 +5,6 @@ from google.oauth2 import service_account
 from dotenv import load_dotenv
 from celery.schedules import crontab
 
-# Load environment variables
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -16,13 +15,31 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY')
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
+# ✅ FIX: ALLOWED_HOSTS takes plain hostnames only — no http:// or https:// prefix.
+# Your original had 'http://16.16.98.131' and 'https://16.16.98.131' which Django
+# ignores / rejects, causing DisallowedHost errors in production.
 ALLOWED_HOSTS = [
-    '192.168.100.107', 'localhost', '127.0.0.1', '0.0.0.0',
-    '10.126.232.156', '192.168.100.108', '10.199.198.201', '10.199.198.22','192.168.100.107'
+    '192.168.100.107',
+    'localhost',
+    '127.0.0.1',
+    '0.0.0.0',
+    '10.126.232.156',
+    '192.168.100.108',
+    '10.199.198.201',
+    '10.199.198.22',
+    'api.connectdial.com',
+    '16.16.98.131',          # plain IP — no scheme
 ]
 
 AUTH_USER_MODEL = 'users.User'
 SITE_ID = 1
+
+# ✅ GOOGLE_CLIENT_ID — Web OAuth 2.0 Client ID from Google Cloud Console.
+# Must match webClientId in the React Native app's configureGoogleSignin().
+GOOGLE_CLIENT_ID         = os.getenv('GOOGLE_CLIENT_ID')
+GOOGLE_ANDROID_CLIENT_ID = os.getenv('GOOGLE_ANDROID_CLIENT_ID', '')  # optional
+GOOGLE_IOS_CLIENT_ID     = os.getenv('GOOGLE_IOS_CLIENT_ID', '')      # optional
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ======================
@@ -82,12 +99,12 @@ WSGI_APPLICATION = 'connectdial.wsgi.application'
 # ======================
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'connectdial_db',
-        'USER': 'gilly',
-        'PASSWORD': 'Iam1@Nitronitro',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'ENGINE':   'django.db.backends.postgresql',
+        'NAME':     'connectdial_db',
+        'USER':     'gilly',
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST':     os.getenv('DB_HOST', 'localhost'),
+        'PORT':     os.getenv('DB_PORT', '5432'),
     }
 }
 
@@ -110,60 +127,119 @@ TEMPLATES = [
 ]
 
 # ======================
-# STATIC & MEDIA (Google Cloud Storage)
+# STATIC & MEDIA — Google Cloud Storage (Firebase Storage bucket)
 # ======================
-STATIC_URL = 'static/'
+#
+# 'connect-c894b.firebasestorage.app' is a Firebase Storage bucket backed by GCS.
+# django-storages accesses it via the standard GCS JSON API using your service account.
+#
+# REQUIRED on your Firebase/GCS bucket for the service account:
+#   IAM role: roles/storage.objectAdmin  (Storage Object Admin)
+#
+# With GS_QUERYSTRING_AUTH = False (below), files must also be publicly readable.
+# In GCS Console → Bucket → Permissions → Add:
+#   Principal: allUsers
+#   Role:      Storage Object Viewer
+#
+# Public URL format:
+#   https://storage.googleapis.com/connect-c894b.firebasestorage.app/<filename>
+# ======================
 
+STATIC_URL  = 'static/'
 GS_BUCKET_NAME = 'connect-c894b.firebasestorage.app'
-GS_KEY_PATH = os.path.join(BASE_DIR, 'firebase-service-account.json')
+GS_KEY_PATH    = os.path.join(BASE_DIR, 'firebase-service-account.json')
 
 if os.path.exists(GS_KEY_PATH):
     GS_CREDENTIALS = service_account.Credentials.from_service_account_file(GS_KEY_PATH)
+
     STORAGES = {
-        "default": {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage"},
+        "default":     {"BACKEND": "storages.backends.gcloud.GoogleCloudStorage"},
         "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
     }
+
     MEDIA_URL = f'https://storage.googleapis.com/{GS_BUCKET_NAME}/'
+
+    # ✅ FIX: Without this, every media URL is a signed URL that expires in ~1 hour.
+    # Profile images and any stored file will return 403 after expiry.
+    # Setting False makes URLs permanent public links (bucket must allow allUsers read).
+    GS_QUERYSTRING_AUTH = False
+
+    # ✅ FIX: Without this, two uploads with the same filename silently overwrite each other.
+    # django-storages will append a unique suffix to avoid collisions.
+    GS_FILE_OVERWRITE = False
+
+    # ✅ Cache-Control so browsers and CDNs cache media files for 24h
+    GS_OBJECT_PARAMETERS = {
+        'cache_control': 'public, max-age=86400',
+    }
+
 else:
-    MEDIA_URL = '/media/'
+    # Fallback: local filesystem (no firebase-service-account.json present)
+    MEDIA_URL  = '/media/'
     MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
-# Google Cloud Storage tweaks
-GS_DEFAULT_TIMEOUT = 300
+# GCS connection tuning
+GS_DEFAULT_TIMEOUT    = 300
 GS_CONNECTION_TIMEOUT = 300
-GS_BLOB_CHUNK_SIZE = 1024 * 1024 * 5  # 5MB
+GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 5  # 5 MB
 
 # ======================
-# CORS (⚠️ Change before production!)
+# CORS
 # ======================
-CORS_ALLOW_ALL_ORIGINS = True  # ← Security risk in production
+CORS_ALLOWED_ORIGINS = [
+    'http://16.16.98.131',
+    'https://16.16.98.131',
+    'http://api.connectdial.com',
+    'https://api.connectdial.com',
+]
+CORS_ALLOW_CREDENTIALS = True
 
 # ======================
-# AUTHENTICATION
+# CSRF
 # ======================
-AUTHENTICATION_BACKENDS = (
+CSRF_TRUSTED_ORIGINS = [
+    'http://16.16.98.131',
+    'https://16.16.98.131',
+    'http://api.connectdial.com',
+    'https://api.connectdial.com',
+]
+
+# ======================
+# AUTHENTICATION BACKENDS
+# ======================
+AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',
-)
+]
 
-# Allauth settings
-ACCOUNT_EMAIL_VERIFICATION = 'none'
+# ======================
+# ALLAUTH — headless / API mode
+# GoogleSignInView verifies id_tokens directly — no OAuth redirect used.
+# ======================
+ACCOUNT_EMAIL_VERIFICATION    = 'none'    # OTP-based verification handled manually
+ACCOUNT_EMAIL_REQUIRED        = True
+ACCOUNT_UNIQUE_EMAIL          = True
+ACCOUNT_USERNAME_REQUIRED     = False
 ACCOUNT_AUTHENTICATION_METHOD = 'email'
-ACCOUNT_EMAIL_REQUIRED = True
-ACCOUNT_UNIQUE_EMAIL = True
-SOCIALACCOUNT_AUTO_SIGNUP = True
-SOCIALACCOUNT_LOGIN_ON_GET = True
+
+SOCIALACCOUNT_AUTO_SIGNUP                       = True
+SOCIALACCOUNT_EMAIL_REQUIRED                    = False
+SOCIALACCOUNT_EMAIL_AUTHENTICATION              = True
+SOCIALACCOUNT_EMAIL_AUTHENTICATION_AUTO_CONNECT = True
+# ✅ FIX: SOCIALACCOUNT_LOGIN_ON_GET = True removed — it's a CSRF security risk
+# that allows GET requests to complete social login without a CSRF token.
 
 SOCIALACCOUNT_PROVIDERS = {
     'google': {
         'APP': {
             'client_id': os.getenv('GOOGLE_CLIENT_ID'),
-            'secret': os.getenv('GOOGLE_CLIENT_SECRET'),
-            'key': '',
+            'secret':    os.getenv('GOOGLE_CLIENT_SECRET'),
+            'key':       '',
         },
-        'SCOPE': ['profile', 'email'],
-        'AUTH_PARAMS': {'access_type': 'online'},
+        'SCOPE':          ['profile', 'email'],
+        'AUTH_PARAMS':    {'access_type': 'online'},
         'FETCH_USERINFO': True,
+        'VERIFIED_EMAIL': True,
     }
 }
 
@@ -172,17 +248,23 @@ SOCIALACCOUNT_PROVIDERS = {
 # ======================
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.TokenAuthentication',  # ← DRF Token Auth
+        'rest_framework.authentication.TokenAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
+    'DEFAULT_SCHEMA_CLASS':        'drf_spectacular.openapi.AutoSchema',
+    'DEFAULT_PAGINATION_CLASS':    'rest_framework.pagination.LimitOffsetPagination',
     'PAGE_SIZE': 10,
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
     'DEFAULT_THROTTLE_RATES': {
-        'login': '10/min',
-        'otp': '5/min',
+        'anon':           '60/min',
+        'user':           '300/min',
+        'login':          '10/min',
+        'otp':            '5/min',
         'password_reset': '5/min',
     },
 }
@@ -191,202 +273,180 @@ REST_FRAMEWORK = {
 # DJ-REST-AUTH
 # ======================
 REST_AUTH = {
-    'USE_JWT': False,
-    'TOKEN_MODEL': 'rest_framework.authtoken.models.Token',
+    'USE_JWT':                   False,
+    'TOKEN_MODEL':               'rest_framework.authtoken.models.Token',
     'OLD_PASSWORD_FIELD_ENABLED': True,
+    'REGISTER_SERIALIZER':       'dj_rest_auth.registration.serializers.RegisterSerializer',
 }
 
 # ======================
 # DRF SPECTACULAR
 # ======================
 SPECTACULAR_SETTINGS = {
-    'TITLE': 'ConnectDial API',
-    'DESCRIPTION': 'ConnectDial Backend API Documentation',
-    'VERSION': '1.0.0',
+    'TITLE':                'ConnectDial API',
+    'DESCRIPTION':          'ConnectDial Backend API Documentation',
+    'VERSION':              '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
-    'COMPONENT_SPLIT_PATCH': True,
+    'COMPONENT_SPLIT_PATCH':   True,
 }
 
 # ======================
 # EMAIL (Gmail SMTP)
 # ======================
-EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
-EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
-EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
-EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST          = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT          = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS       = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@connectdial.com')
+DEFAULT_FROM_EMAIL  = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@connectdial.com')
 
 # ======================
 # CELERY
 # ======================
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_BROKER_URL     = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-CELERY_TIMEZONE = 'UTC'
+CELERY_TIMEZONE       = 'UTC'
 
 CELERY_BEAT_SCHEDULE = {
-    # Core tasks
     'trigger-bot-engagement-every-12h': {
-        'task': 'posts.tasks.coordinate_bot_engagement',
+        'task':     'posts.tasks.coordinate_bot_engagement',
         'schedule': crontab(hour='*/12'),
     },
-    'bot-social-expansion': {
-        'task': 'posts.tasks.expand_bot_social_graph',
-        'schedule': crontab(hour='*/8'),
-        'args': (15,),
+    'check-unread-every-2-minutes': {
+        'task': 'notifications.tasks.check_unread_notifications_periodic',
+        'schedule': 120.0,  # Time in seconds (2 minutes)
     },
-
-    # Sports news sync (staggered)
+    'bot-social-expansion': {
+        'task':     'posts.tasks.expand_bot_social_graph',
+        'schedule': crontab(hour='*/8'),
+        'args':     (15,),
+    },
     'sync-premier-league': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=0, hour='*/4'),
-        'args': ('Premier League', 5),
+        'args':     ('Premier League', 5),
     },
     'sync-nba': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=5, hour='*/4'),
-        'args': ('NBA', 6),
+        'args':     ('NBA', 6),
     },
     'sync-champions-league': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=10, hour='*/4'),
-        'args': ('Champions League', 5),
+        'args':     ('Champions League', 5),
     },
     'sync-nfl': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=15, hour='*/4'),
-        'args': ('NFL', 6),
+        'args':     ('NFL', 6),
     },
     'sync-la-liga': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=20, hour='*/4'),
-        'args': ('La Liga', 4),
+        'args':     ('La Liga', 4),
     },
     'sync-f1': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=25, hour='*/4'),
-        'args': ('F1', 4),
+        'args':     ('F1', 4),
     },
     'sync-kenya-premier-league': {
-        'task': 'posts.tasks.sync_bots_with_live_sports',
+        'task':     'posts.tasks.sync_bots_with_live_sports',
         'schedule': crontab(minute=30, hour='*/4'),
-        'args': ('Kenya Premier League', 3),
+        'args':     ('Kenya Premier League', 3),
     },
-
-    # YouTube Shorts (staggered)
     'post-premier-league-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=30, hour='*/8'),
-        'args': ('Premier League',),
+        'args':     ('Premier League',),
     },
     'post-nba-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=35, hour='*/8'),
-        'args': ('NBA',),
+        'args':     ('NBA',),
     },
     'post-nfl-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=40, hour='*/8'),
-        'args': ('NFL',),
+        'args':     ('NFL',),
     },
     'post-champions-league-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=45, hour='*/8'),
-        'args': ('Champions League',),
+        'args':     ('Champions League',),
     },
     'post-f1-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=50, hour='*/8'),
-        'args': ('F1',),
+        'args':     ('F1',),
     },
     'post-kenya-premier-league-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=55, hour='*/8'),
-        'args': ('Kenya Premier League',),
+        'args':     ('Kenya Premier League',),
     },
-
-    # Lower priority leagues (every 12h)
     'post-la-liga-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=0, hour='*/12'),
-        'args': ('La Liga',),
+        'args':     ('La Liga',),
     },
     'post-serie-a-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=5, hour='*/12'),
-        'args': ('Serie A',),
+        'args':     ('Serie A',),
     },
     'post-bundesliga-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=10, hour='*/12'),
-        'args': ('Bundesliga',),
+        'args':     ('Bundesliga',),
     },
     'post-ligue-1-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=15, hour='*/12'),
-        'args': ('Ligue 1',),
+        'args':     ('Ligue 1',),
     },
     'post-mlb-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=20, hour='*/12'),
-        'args': ('MLB',),
+        'args':     ('MLB',),
     },
     'post-nhl-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=25, hour='*/12'),
-        'args': ('NHL',),
+        'args':     ('NHL',),
     },
     'post-afcon-shorts': {
-        'task': 'posts.tasks.fetch_and_post_youtube_shorts',
+        'task':     'posts.tasks.fetch_and_post_youtube_shorts',
         'schedule': crontab(minute=30, hour='*/12'),
-        'args': ('Afcon',),
+        'args':     ('Afcon',),
     },
 }
 
 # ======================
 # EXTERNAL API KEYS
 # ======================
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-NEWS_API_KEY = os.getenv('NEWS_API_KEY')
+GEMINI_API_KEY  = os.getenv('GEMINI_API_KEY')
+NEWS_API_KEY    = os.getenv('NEWS_API_KEY')
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
 # ======================
 # OTP SETTINGS
 # ======================
-OTP_EXPIRY_SECONDS = 300
-OTP_MAX_ATTEMPTS = 5
+OTP_EXPIRY_SECONDS  = 300
+OTP_MAX_ATTEMPTS    = 5
 OTP_RESEND_COOLDOWN = 30
-# 1 = single ALB, 2 = CloudFront + ALB, 0 = no proxy
-TRUSTED_PROXY_COUNT = 1
 
-USE_X_FORWARDED_HOST = True
+# ======================
+# PROXY / AWS CONFIG
+# ======================
+TRUSTED_PROXY_COUNT     = 1
+USE_X_FORWARDED_HOST    = True
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-# AWS / Proxy settings
-TRUSTED_PROXY_COUNT = 1
-USE_X_FORWARDED_HOST = True
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-
-# Redis Cache (throttling & sessions)
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": "redis://127.0.0.1:6379/1",
-    }
-}
-
-# Authentication backends
-AUTHENTICATION_BACKENDS = [
-    'django.contrib.auth.backends.ModelBackend',
-    'allauth.account.auth_backends.AuthenticationBackend',
-]
-
-# CSRF trusted origins
-CSRF_TRUSTED_ORIGINS = [
-    'https://api.connectdial.com',
-    'http://api.connectdial.com',
-    'https://16.16.98.131',
-    'http://16.16.98.131',
-]
+# ======================
+# APP NAME
+# ======================
+APP_NAME = 'ConnectDial'

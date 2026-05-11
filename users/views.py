@@ -90,26 +90,7 @@ class PasswordResetThrottle(AnonRateThrottle):
 # ─────────────────────────────────────────────
 # IP RETRIEVAL — AWS / PROXY AWARE
 # ─────────────────────────────────────────────
-#
-# How AWS ALB works:
-#   X-Forwarded-For: <real-client>, <proxy1>, ..., <ALB-ip>
-#   The real client IP is the LEFTMOST entry when TRUSTED_PROXY_COUNT = 1.
-#
-# How CloudFront + ALB works:
-#   X-Forwarded-For: <real-client>, <cloudfront-edge>, <ALB-ip>
-#   Set TRUSTED_PROXY_COUNT = 2 in settings.py for this topology.
-#
-# Configure in settings.py:
-#   TRUSTED_PROXY_COUNT = 1   # single ALB
-#   TRUSTED_PROXY_COUNT = 2   # CloudFront + ALB
-#   TRUSTED_PROXY_COUNT = 0   # no proxy, use REMOTE_ADDR directly
-#
-# Also recommended in settings.py for HTTPS behind ALB:
-#   USE_X_FORWARDED_HOST = True
-#   SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-# ─────────────────────────────────────────────
 
-# Read trusted proxy count from settings; default to 1 (single ALB)
 _TRUSTED_PROXY_COUNT = getattr(settings, "TRUSTED_PROXY_COUNT", 1)
 
 
@@ -123,30 +104,15 @@ def _get_client_ip(request) -> str:
       3. Walk right-to-left, skipping one IP per trusted proxy hop.
       4. Return the first IP that is NOT a trusted proxy.
       5. Fall back to REMOTE_ADDR if no XFF header is present.
-
-    This correctly handles:
-      - AWS ALB (appends its own IP to XFF)
-      - CloudFront + ALB (two trusted hops)
-      - Plain Nginx reverse proxy
-      - Direct connections (no proxy)
-      - Spoofed XFF headers (ignored beyond trusted proxy count)
-
-    Returns an empty string rather than raising an exception so that
-    IP logging never crashes a real auth request.
     """
     xff = request.META.get("HTTP_X_FORWARDED_FOR", "").strip()
 
     if xff:
-        # Split, strip whitespace, drop empty segments
         ip_chain = [segment.strip() for segment in xff.split(",") if segment.strip()]
-
         if ip_chain:
-            # The real client IP sits at index = len(chain) - trusted_proxies - 1
-            # e.g. chain = [client, alb]  →  idx = 2 - 1 - 1 = 0  →  client ✓
             idx = max(0, len(ip_chain) - _TRUSTED_PROXY_COUNT - 1)
             return ip_chain[idx]
 
-    # No XFF header — direct connection or proxy stripped the header
     return request.META.get("REMOTE_ADDR", "")
 
 
@@ -196,7 +162,8 @@ def _issue_signed_reset_token(user) -> str:
     timestamp = int(timezone.now().timestamp())
     payload   = f"{user.id}:{timestamp}".encode()
     secret    = settings.SECRET_KEY.encode()
-    signature = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()
+    # FIX: use positional arg instead of digestmod= keyword for full Python 3 compatibility
+    signature = hmac.new(secret, payload, hashlib.sha256).hexdigest()
     return f"{user.id}:{timestamp}:{signature}"
 
 
@@ -213,7 +180,8 @@ def _decode_signed_reset_token(raw_token: str):
         user_id, timestamp, signature = parts
         payload      = f"{user_id}:{timestamp}".encode()
         secret       = settings.SECRET_KEY.encode()
-        expected_sig = hmac.new(secret, payload, digestmod=hashlib.sha256).hexdigest()
+        # FIX: use positional arg instead of digestmod= keyword for full Python 3 compatibility
+        expected_sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected_sig, signature):
             raise ValueError("Invalid token signature.")
@@ -247,13 +215,7 @@ def _get_user_by_identifier(identifier: str):
     )
     return qs.order_by('-date_joined').first() if qs.exists() else None
 
-def _log_audit(user, action, ip, details=None):
-    """Log an audit event with a clean IP address."""
-    # 1. Clean the IP (Fixes the DataError)
-    if ip and isinstance(ip, str) and ',' in ip:
-        ip = ip.split(',')[0].strip()
 
-<<<<<<< Updated upstream
 def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = None):
     """Centralized audit logging — silently skips unknown action values."""
     try:
@@ -265,7 +227,7 @@ def _log_audit(user, action: str, ip: str, device: str = None, extra: dict = Non
             extra=extra or {},
         )
     except Exception:
-        pass  # Never let audit logging crash a real request
+        pass
 
 
 def _log_login(user, request):
@@ -284,34 +246,8 @@ def _log_login(user, request):
             success=True,
         )
     except Exception:
-        pass  # Never let login history crash a real request
+        pass
 
-=======
-    # 2. Fix the TypeError: Remove 'details' if it's not in your model
-    return AuditLog.objects.create(
-        user=user,
-        action=action,
-        ip_address=ip
-        # removed details=details because it doesn't exist in your model
-    )
-def _log_login(user, request):
-    """Log successful login with IP & device."""
-    # Handle comma-separated IP lists from proxies like Cloudflare/Nginx
-    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
-    if x_forwarded_for:
-        ip = x_forwarded_for.split(",")[0].strip()
-    else:
-        ip = request.META.get("REMOTE_ADDR")
-
-    device = request.META.get("HTTP_USER_AGENT", "Unknown Device")
-    
-    LoginHistory.objects.create(
-        user=user,
-        ip_address=ip,
-        device_info=device,
-        success=True,
-    )
->>>>>>> Stashed changes
     _log_audit(user, "login_success", ip, device)
 
 
@@ -471,20 +407,8 @@ class VerifyOTPView(APIView):
 
         otp_obj.delete()
 
-<<<<<<< Updated upstream
-        # Single consistent IP extraction for all OTP outcomes
         ip = _get_client_ip(request)
 
-=======
-        # FIXED: Handle Cloudflare/Proxy comma-separated IP lists
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(',')[0].strip()
-        else:
-            ip = request.META.get('REMOTE_ADDR')
-
-        # ── Purpose-specific responses ──────────────────────────────────────
->>>>>>> Stashed changes
         if purpose == 'password_reset':
             reset_token = _issue_signed_reset_token(user)
             _log_audit(user, 'password_reset_otp_verified', ip)
@@ -759,18 +683,58 @@ class GoogleSignInView(APIView):
         if not raw_token:
             return Response({'error': 'id_token is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        client_id = settings.SOCIALACCOUNT_PROVIDERS['google']['APP']['client_id']
+        # Collect all valid client IDs — web is required, Android/iOS are optional
+        web_client_id     = getattr(settings, 'GOOGLE_CLIENT_ID', '')
+        android_client_id = getattr(settings, 'GOOGLE_ANDROID_CLIENT_ID', '')
+        ios_client_id     = getattr(settings, 'GOOGLE_IOS_CLIENT_ID', '')
 
-        try:
-            idinfo = google_id_token.verify_oauth2_token(
-                raw_token, google_requests.Request(), client_id
+        valid_client_ids = [
+            cid for cid in [web_client_id, android_client_id, ios_client_id] if cid
+        ]
+
+        if not valid_client_ids:
+            return Response(
+                {'error': 'Google Sign-In is not configured on this server.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        except ValueError:
-            return Response({'error': 'Invalid Google token.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        # Try verifying against each registered client ID
+        idinfo     = None
+        last_error = None
+
+        for cid in valid_client_ids:
+            try:
+                idinfo = google_id_token.verify_oauth2_token(
+                    raw_token, google_requests.Request(), cid
+                )
+                break  # Successfully verified
+            except ValueError as e:
+                last_error = e
+                continue
+
+        if idinfo is None:
+            return Response(
+                {'error': f'Invalid Google token: {str(last_error)}'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # Extra safety: ensure aud or azp matches one of our registered client IDs.
+        # Android tokens have aud = web_client_id and azp = android_client_id.
+        # iOS tokens have aud = ios_client_id.
+        token_aud = idinfo.get('aud', '')
+        token_azp = idinfo.get('azp', '')
+        if token_aud not in valid_client_ids and token_azp not in valid_client_ids:
+            return Response(
+                {'error': 'Token audience does not match any registered client ID.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         email = idinfo.get('email')
         if not email or not idinfo.get('email_verified', False):
-            return Response({'error': 'Invalid or unverified Google email.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Invalid or unverified Google email.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             user    = User.objects.get(email__iexact=email)
@@ -778,7 +742,8 @@ class GoogleSignInView(APIView):
         except User.DoesNotExist:
             username = _make_unique_username(email.split('@')[0])
             user = User.objects.create_user(
-                username=username, email=email,
+                username=username,
+                email=email,
                 first_name=idinfo.get('given_name', ''),
                 last_name=idinfo.get('family_name', ''),
             )
@@ -922,24 +887,42 @@ class UserProfileUpdateView(generics.RetrieveUpdateAPIView):
 # ─────────────────────────────────────────────
 # CUSTOM LOGIN (DRF Token)
 # ─────────────────────────────────────────────
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.decorators import method_decorator
 
-@method_decorator(csrf_exempt, name='dispatch')
 class CustomLoginView(LoginView):
     serializer_class = CustomLoginSerializer
 
     def post(self, request, *args, **kwargs):
-        response = super().post(request, *args, **kwargs)
+        try:
+            response = super().post(request, *args, **kwargs)
 
-        if response.status_code == 200:
-            token_key             = response.data.get("key")
-            token                 = Token.objects.get(key=token_key)
-            user                  = token.user
-            response.data["user"] = UserSerializer(user).data
-            _log_login(user, request)
+            if response.status_code == 200:
+                token_key = response.data.get("key")
 
-        return response
+                if not token_key:
+                    return Response(
+                        {"detail": "Token not generated by auth system."},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
+                try:
+                    token = Token.objects.get(key=token_key)
+                except Token.DoesNotExist:
+                    return Response(
+                        {"detail": "Invalid token generated."},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
+                user = token.user
+                response.data["user"] = UserSerializer(user).data
+                _log_login(user, request)
+
+            return response
+
+        except Exception as e:
+            return Response(
+                {"detail": "Login failed", "error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 # ─────────────────────────────────────────────
@@ -960,3 +943,51 @@ class LogoutView(APIView):
             request.user.auth_token.delete()
 
         return Response({"message": "Logged out successfully"}, status=status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────
+# TEST VIEW — Remove before production
+# ─────────────────────────────────────────────
+
+class TestGoogleTokenView(APIView):
+    """POST /auth/social/google/test/ — Temporary token debug view."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        token = request.data.get('id_token')
+        if not token:
+            return Response({"error": "No token provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        web_client_id     = getattr(settings, 'GOOGLE_CLIENT_ID', '')
+        android_client_id = getattr(settings, 'GOOGLE_ANDROID_CLIENT_ID', '')
+        ios_client_id     = getattr(settings, 'GOOGLE_IOS_CLIENT_ID', '')
+        valid_client_ids  = [cid for cid in [web_client_id, android_client_id, ios_client_id] if cid]
+
+        idinfo     = None
+        last_error = None
+
+        for cid in valid_client_ids:
+            try:
+                idinfo = google_id_token.verify_oauth2_token(
+                    token, google_requests.Request(), cid
+                )
+                break
+            except Exception as e:
+                last_error = e
+                continue
+
+        if idinfo:
+            return Response({
+                "valid":   True,
+                "email":   idinfo.get('email'),
+                "name":    idinfo.get('name'),
+                "aud":     idinfo.get('aud'),
+                "azp":     idinfo.get('azp'),
+                "sub":     idinfo.get('sub'),
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "valid": False,
+            "error": str(last_error),
+            "tried_client_ids": valid_client_ids,
+        }, status=status.HTTP_400_BAD_REQUEST)

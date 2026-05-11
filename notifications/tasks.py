@@ -86,3 +86,19 @@ def send_push_notification_task(user_id, title, message, notification_type=None,
         return f"❌ User ID {user_id} not found."
     except Exception as e:
         return f"❌ Firebase Error: {str(e)}"
+
+
+
+@shared_task
+def check_unread_notifications_periodic():
+    # This is just an example of what you might do periodically
+    from .models import Notification
+    from django.contrib.auth import get_user_model
+    
+    User = get_user_model()
+    # Logic: Find users with more than 5 unread notifications
+    for user in User.objects.all():
+        count = Notification.objects.filter(recipient=user, is_read=False).count()
+        if count > 0:
+            print(f"User {user.username} has {count} unread notifications.")
+            # You could trigger a push here if you wanted
