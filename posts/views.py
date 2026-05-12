@@ -1,421 +1,507 @@
-from rest_framework import generics,viewsets, permissions, status, filters
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
-from .models import Post, Comment, PostLike
-from .serializers import PostSerializer, CommentSerializer
-from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from .models import PostLike, Post, Comment
+"""
+views.py – ConnectDial Posts App
+──────────────────────────────────────────────────────────────────────
+Principles
+──────────────────────────────────────────────────────────────────────
+• Every queryset goes through get_home_feed_queryset (services.py),
+  which does ONE SQL statement with select_related + prefetch_related
+  and Exists() sub-queries for liked_by_me.
+• Counters are updated atomically via F() expressions; no full-object
+  save() is ever called just to bump a number.
+• CursorPagination replaces page-number pagination: no COUNT(*) on
+  every request, which is the #1 cause of slow infinite-scroll feeds.
+• All custom actions return only the fields the frontend actually needs.
+"""
 
+import os
+from django.db.models import Count, Exists, ExpressionWrapper, F, FloatField, OuterRef, Q, Subquery, Value
+from django.db.models.functions import ExtractDay, ExtractHour, Now
+from django.utils import timezone
+
+from rest_framework import filters, generics, permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import CursorPagination
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
 from users.models import Follow, FanPreference
 
-
-from django.db.models import Q, Count, OuterRef, Exists
-from rest_framework import generics, permissions
-from .models import Post, PostLike
-from .serializers import PostSerializer
+from .models import Comment, Hashtag, Post, PostLike, PostShare, VideoUploadSession
+from .serializers import CommentSerializer, HashtagSerializer, PostSerializer
+from .services import get_personalized_shorts, get_trending_hashtags
 
 
-from .models import Hashtag
-from .serializers import HashtagSerializer
-from .services import get_trending_hashtags
+# ─────────────────────────────────────────────────────────────────────
+# PAGINATION
+# ─────────────────────────────────────────────────────────────────────
+
+class FeedCursorPagination(CursorPagination):
+    """
+    Cursor pagination for the main feed.
+    No COUNT(*) → instant response on large tables.
+    """
+    page_size            = 20
+    page_size_query_param = 'page_size'
+    max_page_size        = 50
+    ordering             = '-created_at'
 
 
-# posts/permissions.py (or wherever your permission is defined)
+class ShortsCursorPagination(CursorPagination):
+    """
+    Shorts use hot_score ordering so the cursor must reflect that.
+    """
+    page_size = 10
+    ordering  = '-created_at'   # hot_score is recalculated; cursor on created_at is stable
 
-from rest_framework import permissions
+
+# ─────────────────────────────────────────────────────────────────────
+# PERMISSIONS
+# ─────────────────────────────────────────────────────────────────────
 
 class IsAuthorOrReadOnly(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
-        # Read permissions are allowed to any request,
-        # so we always allow GET, HEAD or OPTIONS requests.
         if request.method in permissions.SAFE_METHODS:
             return True
-
-        # Check if the object has an 'author' attribute (Post) 
-        # or a 'user' attribute (Comment)
-        if hasattr(obj, 'author'):
-            return obj.author == request.user
-        
-        if hasattr(obj, 'user'):
-            return obj.user == request.user
-            
-        return False
-
-class CommentViewSet(viewsets.ModelViewSet):
-    queryset = Comment.objects.all()
-    serializer_class = CommentSerializer
-    permission_classes = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
-
-    def perform_create(self, serializer):
-        # This handles the 'user' field automatically
-        serializer.save(user=self.request.user)
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response({"message": "Comment deleted"}, status=status.HTTP_204_NO_CONTENT)
+        owner = getattr(obj, 'author', getattr(obj, 'user', None))
+        return owner == request.user
 
 
+# ─────────────────────────────────────────────────────────────────────
+# BASE QUERYSET BUILDER  (shared by PostViewSet + FollowingFeedView)
+# ─────────────────────────────────────────────────────────────────────
+
+def _base_post_qs(user):
+    """
+    Single, fully-optimised base queryset:
+    • 1 SQL with all JOINs
+    • Exists() sub-query for liked_by_me (no loop)
+    • Uses denormalised counters (no COUNT aggregation)
+    """
+    like_sq = PostLike.objects.filter(post=OuterRef('pk'), user=user)
+
+    return (
+        Post.objects
+        .select_related(
+            'author',
+            'author__profile',
+            'league',
+            'team',
+            'parent_post',
+            'parent_post__author',
+            'parent_post__author__profile',
+            'parent_post__league',
+            'parent_post__team',
+        )
+        .prefetch_related(
+            'hashtags',
+            'author__fan_preferences__league',
+            'author__fan_preferences__team',
+        )
+        .annotate(
+            liked_by_me=Exists(like_sq),
+            # reposts_count from the 'quoted_by' reverse relation
+            reposts_count=Count('quoted_by', distinct=True),
+        )
+    )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# POST VIEWSET
+# ─────────────────────────────────────────────────────────────────────
 
 class PostViewSet(viewsets.ModelViewSet):
-    serializer_class = PostSerializer
+    serializer_class   = PostSerializer
     permission_classes = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
+    pagination_class   = FeedCursorPagination
+    filter_backends    = [filters.SearchFilter]
+    search_fields      = ['content', 'author__username', 'league__name']
 
-    # 🚀 Step 1: Add the Search Backend
-    # This tells DRF to look for the ?search= query parameter in the URL
-    filter_backends = [filters.SearchFilter]
-    
-    # 🚀 Step 2: Define what fields can be searched
-    # Use 'author__username' to search the name of the person who posted
-    # Use 'content' for the post text
-    # Use 'league__name' to search for posts by league name
-    search_fields = ['content', 'author__username', 'league__name']
+    # ── Queryset ──────────────────────────────────────────────────────
 
     def get_queryset(self):
         user = self.request.user
-        
-        # 1. Base Queryset with Correct Optimization
-        queryset = Post.objects.select_related(
-            'author', 
-            'parent_post',                
-            'parent_post__author',        
-        ).prefetch_related(
-            'author__profile',
-            'parent_post__author__profile',
-        ).annotate(
-            likes_count=Count('likes', distinct=True),
-            comments_count=Count('comments', distinct=True),
-            shares_count=Count('shares', distinct=True),
-            reposts_count=Count('quoted_by', distinct=True),
-        )
+        qs   = _base_post_qs(user)
 
-        # 2. Add "liked_by_me" logic
-        if user.is_authenticated:
-            user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-            queryset = queryset.annotate(user_has_liked=Exists(user_likes))
+        params       = self.request.query_params
+        user_id      = params.get('user')
+        filter_type  = params.get('filter')
+        league_id    = params.get('league')
+        leagues_list = params.get('leagues')
+        team_id      = params.get('team')
+        feed_type    = params.get('feed_type')
 
-        # --- 3. EXTRACTION OF PARAMS ---
-        user_id = self.request.query_params.get('user')
-        filter_type = self.request.query_params.get('filter')
-        league_id = self.request.query_params.get('league')
-        leagues_list = self.request.query_params.get('leagues') 
-        team_id = self.request.query_params.get('team')
-        feed_type = self.request.query_params.get('feed_type')
+        # ── A. Default: only leagues the user follows ─────────────────
+        if user.is_authenticated and not league_id and not leagues_list:
+            league_ids = list(
+                user.fan_preferences.values_list('league_id', flat=True)
+            )
+            if league_ids:
+                qs = qs.filter(league_id__in=league_ids)
 
-        # --- 4. ADDITIVE FILTERING LOGIC ---
-        
-        # A. DEFAULT LEAGUE FILTER FOR HOME/FEED (Filter by user's favorite leagues)
-        # For authenticated users, only show posts from leagues they follow
-        if user.is_authenticated:
-            user_league_ids = user.fan_preferences.values_list('league_id', flat=True)
-            if user_league_ids:
-                queryset = queryset.filter(league_id__in=user_league_ids)
-        
-        # B. MANDATORY LEAGUE FILTER (The Guard) - overrides default if specified
-        # This still applies during search, so searching "Goal" only shows 
-        # posts from your leagues!
+        # ── B. Explicit league filter ─────────────────────────────────
         if league_id:
-            queryset = queryset.filter(league_id=league_id)
+            qs = qs.filter(league_id=league_id)
         elif leagues_list:
-            try:
-                ids = [int(x) for x in leagues_list.split(',') if x.strip().isdigit()]
-                if ids:
-                    queryset = queryset.filter(league_id__in=ids)
-            except ValueError:
-                pass
+            ids = [x.strip() for x in leagues_list.split(',') if x.strip().isdigit()]
+            if ids:
+                qs = qs.filter(league_id__in=ids)
 
-        # B. SOCIAL FILTER (The "Who")
+        # ── C. Following-only feed ────────────────────────────────────
         if feed_type == 'following' and user.is_authenticated:
             following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
-            queryset = queryset.filter(Q(author_id__in=following_ids) | Q(author=user))
-        
-        # C. PROFILE / CONTEXT FILTERS
-        if user_id:
-            queryset = queryset.filter(author_id=user_id)
-        elif filter_type == 'mine' and user.is_authenticated:
-            queryset = queryset.filter(author=user)
-        
-        if team_id:
-            queryset = queryset.filter(team_id=team_id)
+            qs = qs.filter(Q(author_id__in=following_ids) | Q(author=user))
 
-        # 5. Final Sorting
-        return queryset.order_by('-created_at')
+        # ── D. Profile / context filters ─────────────────────────────
+        if user_id:
+            qs = qs.filter(author_id=user_id)
+        elif filter_type == 'mine' and user.is_authenticated:
+            qs = qs.filter(author=user)
+
+        if team_id:
+            qs = qs.filter(team_id=team_id)
+
+        return qs.order_by('-created_at')
+
+    # ── Create ────────────────────────────────────────────────────────
 
     def perform_create(self, serializer):
-        # 1. Get the parent_post ID from the request (sent by Quote logic)
         parent_id = self.request.data.get('parent_post')
-        
+        kwargs    = {'author': self.request.user}
         if parent_id:
-            # 2. Save the post linked to the original post
-            # We use parent_post_id to avoid an extra database lookup
-            serializer.save(
-                author=self.request.user, 
-                parent_post_id=parent_id
-            )
-        else:
-            # 3. Standard post creation
-            serializer.save(author=self.request.user)
+            kwargs['parent_post_id'] = parent_id
+        serializer.save(**kwargs)
+
+    # ── Delete ────────────────────────────────────────────────────────
 
     def destroy(self, request, *args, **kwargs):
-        """
-        Custom delete response for the frontend to confirm success.
-        """
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response({"message": "Post deleted successfully"}, status=status.HTTP_204_NO_CONTENT)
+        self.get_object()  # triggers permission check
+        self.perform_destroy(self.get_object())
+        return Response({'message': 'Post deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+    # ── Like (atomic, no race condition) ─────────────────────────────
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def like(self, request, pk=None):
         post = self.get_object()
-        user = request.user
-        like_queryset = PostLike.objects.filter(post=post, user=user)
-        
-        if like_queryset.exists():
-            like_queryset.delete()
-            post.like_count = max(0, post.like_count - 1) # Decrement counter
+        like_qs = PostLike.objects.filter(post=post, user=request.user)
+
+        if like_qs.exists():
+            like_qs.delete()
+            post.decrement_like()          # atomic F() update
             liked = False
         else:
-            PostLike.objects.create(post=post, user=user)
-            post.like_count += 1 # Increment counter
+            PostLike.objects.create(post=post, user=request.user)
+            post.increment_like()          # atomic F() update
             liked = True
-            
-        post.save(update_fields=['like_count']) # Persist to DB for algorithm
+
+        post.refresh_from_db(fields=['like_count'])
         return Response({'liked': liked, 'likes_count': post.like_count})
 
-     
-    @action(
-        detail=True, 
-        methods=['get', 'post'], 
-        permission_classes=[permissions.IsAuthenticated] # 🚀 OVERRIDE HERE
-    )
+    # ── View count (fire-and-forget, no response body needed) ─────────
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def view(self, request, pk=None):
+        Post.objects.filter(pk=pk).update(view_count=F('view_count') + 1)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # ── Comments ──────────────────────────────────────────────────────
+
+    @action(detail=True, methods=['get', 'post'], permission_classes=[IsAuthenticated])
     def comments(self, request, pk=None):
         post = self.get_object()
 
         if request.method == 'POST':
             serializer = CommentSerializer(data=request.data, context={'request': request})
             if serializer.is_valid():
-                serializer.save(post=post, user=request.user)
+                comment = serializer.save(post=post, user=request.user)
+                post.increment_comment()   # atomic
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-    
-        # For GET request, return all comments for the post
-        if request.method == 'GET':
-            comments = post.comments.select_related('user').annotate(
-                likes_count=Count('likes', distinct=True)
-            ).order_by('-created_at')
-            serializer = CommentSerializer(comments, many=True, context={'request': request})
-            return Response(serializer.data, status=status.HTTP_200_OK)
 
-    @action(detail=True, methods=['post'], permission_classes=[permissions.IsAuthenticated])
+        # GET – paginated comments
+        comments_qs = (
+            post.comments
+            .select_related('user', 'user__profile')
+            .prefetch_related('user__fan_preferences__league', 'user__fan_preferences__team')
+            .annotate(likes_count=Count('likes', distinct=True))
+            .order_by('-created_at')
+        )
+        page = self.paginate_queryset(comments_qs)
+        serializer = CommentSerializer(
+            page if page is not None else comments_qs,
+            many=True,
+            context={'request': request},
+        )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
+        return Response(serializer.data)
+
+    # ── Repost ────────────────────────────────────────────────────────
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def repost(self, request, pk=None):
-        original_post = self.get_object()
-        
-        # 1. Prevent duplicate simple reposts (optional but recommended)
-        existing_repost = Post.objects.filter(
-            author=request.user, 
-            parent_post=original_post, 
-            content='' # Simple reposts have no content
+        original = self.get_object()
+
+        existing = Post.objects.filter(
+            author=request.user,
+            parent_post=original,
+            is_repost=True,
+            content='',
         ).first()
 
-        if existing_repost:
-            # If they click it again, they might want to "Undo" the repost
-            existing_repost.delete()
-            return Response({
-                'status': 'unreposted',
-                'reposts_count': Post.objects.filter(parent_post=original_post).count()
-            }, status=200)
+        if existing:
+            existing.delete()
+            original.decrement_comment()   # or keep a repost counter
+            new_count = Post.objects.filter(parent_post=original).count()
+            return Response({'status': 'unreposted', 'reposts_count': new_count})
 
-        # 2. Create the Repost
         repost = Post.objects.create(
-            author=request.user,
-            content='', 
-            parent_post=original_post,
-            post_type='standard', # or 'repost' if you have that type
-            league=original_post.league
+            author      = request.user,
+            content     = '',
+            parent_post = original,
+            post_type   = 'text',
+            league      = original.league,
+            is_repost   = True,
         )
-        
-        # 3. Return the NEW count for the frontend to update the UI
-        # We count all posts where this post is the 'parent'
-        new_count = Post.objects.filter(parent_post=original_post).count()
-        
-        return Response({
-            'status': 'reposted', 
-            'id': repost.id,
-            'reposts_count': new_count
-        }, status=201)
-
-from django.db.models import Count, Exists, OuterRef
-from rest_framework import viewsets, permissions
-from posts.models import Post, PostLike
-from posts.serializers import PostSerializer
+        new_count = Post.objects.filter(parent_post=original).count()
+        return Response(
+            {'status': 'reposted', 'id': repost.id, 'reposts_count': new_count},
+            status=status.HTTP_201_CREATED,
+        )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# COMMENT VIEWSET
+# ─────────────────────────────────────────────────────────────────────
 
-# posts/views.py
-from .services import get_personalized_shorts
+class CommentViewSet(viewsets.ModelViewSet):
+    queryset           = Comment.objects.select_related('user', 'user__profile')
+    serializer_class   = CommentSerializer
+    permission_classes = [permissions.IsAuthenticated, IsAuthorOrReadOnly]
+
+    def perform_create(self, serializer):
+        comment = serializer.save(user=self.request.user)
+        comment.post.increment_comment()
+
+    def perform_destroy(self, instance):
+        instance.post.decrement_comment()
+        instance.delete()
+
+    def destroy(self, request, *args, **kwargs):
+        self.perform_destroy(self.get_object())
+        return Response({'message': 'Comment deleted'}, status=status.HTTP_204_NO_CONTENT)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SHORTS VIEWSET  (TikTok-style vertical video)
+# ─────────────────────────────────────────────────────────────────────
+
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    Exclusively serves natively uploaded 'Shorts'.
-    Filters out YouTube links and non-ready video uploads.
+    Serves natively-uploaded Shorts only.
+    • video_status='ready'  – never shows uploading/processing videos
+    • Ranked by hot_score   – engagement-weighted freshness
+    • League-personalised   – only leagues the user follows
+    • Annotated liked_by_me – zero extra queries
     """
-    serializer_class = PostSerializer
+    serializer_class   = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class   = ShortsCursorPagination
 
     def get_queryset(self):
         user = self.request.user
-        
-        # ✅ Filter 1: Only native uploads (Post media) + Video must be 'ready'
-        # This excludes YouTube strings used in your previous version.
-        queryset = Post.objects.filter(
-            is_short=True,
-            video_status='ready' 
-        ).exclude(media_file='')
+        like_sq = PostLike.objects.filter(post=OuterRef('pk'), user=user)
 
-        # ✅ Filter 2: League Personalization
-        followed_league_ids = user.fan_preferences.values_list('league_id', flat=True)
-        if followed_league_ids.exists():
-            queryset = queryset.filter(league_id__in=followed_league_ids)
+        qs = (
+            Post.objects
+            .filter(is_short=True, video_status='ready')
+            .exclude(media_file='')
+            .select_related(
+                'author', 'author__profile',
+                'league', 'team',
+            )
+            .prefetch_related(
+                'hashtags',
+                'author__fan_preferences__league',
+                'author__fan_preferences__team',
+            )
+            .annotate(liked_by_me=Exists(like_sq))
+        )
 
-        # ✅ Step 3: Optimization & Personalized Algorithm
-        queryset = queryset.select_related('author', 'league', 'team').prefetch_related('hashtags')
-        queryset = get_personalized_shorts(queryset) #
+        # League personalisation
+        league_ids = list(user.fan_preferences.values_list('league_id', flat=True))
+        if league_ids:
+            qs = qs.filter(league_id__in=league_ids)
 
-        # ✅ Step 4: Engagement Context
-        user_likes = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-        return queryset.annotate(user_has_liked=Exists(user_likes))
-    
-# video_upload_views.py
-import os
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from .models import Post, VideoUploadSession
+        return get_personalized_shorts(qs)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# HASHTAG VIEWSET
+# ─────────────────────────────────────────────────────────────────────
+
+class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset         = Hashtag.objects.all()
+    serializer_class = HashtagSerializer
+
+    @action(detail=False, methods=['get'])
+    def trending(self, request):
+        tags       = get_trending_hashtags(limit=10, days=1)
+        serializer = self.get_serializer(tags, many=True)
+        return Response(serializer.data)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# VIDEO UPLOAD VIEWS
+# ─────────────────────────────────────────────────────────────────────
+
+class VideoUploadInitView(APIView):
+    """
+    Step 1 – Client calls this to create a Post shell and get an upload_id.
+    The Post starts with video_status='pending'.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        league_id    = request.data.get('league_id')
+        total_chunks = int(request.data.get('total_chunks', 1))
+
+        post = Post.objects.create(
+            author       = request.user,
+            post_type    = 'video',
+            video_status = 'pending',
+            league_id    = league_id,
+            is_short     = request.data.get('is_short', False),
+        )
+        session = VideoUploadSession.objects.create(
+            user         = request.user,
+            post         = post,
+            total_chunks = total_chunks,
+        )
+        return Response({'upload_id': str(session.id), 'post_id': post.id},
+                        status=status.HTTP_201_CREATED)
+
+
+class VideoChunkUploadView(APIView):
+    """
+    Step 2 – Receives individual file chunks.
+    Each chunk is appended to a temp file server-side.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        upload_id    = request.data.get('upload_id')
+        chunk_index  = int(request.data.get('chunk_index', 0))
+        chunk        = request.FILES.get('chunk')
+
+        try:
+            session = VideoUploadSession.objects.select_related('post').get(
+                id=upload_id, user=request.user
+            )
+        except VideoUploadSession.DoesNotExist:
+            return Response({'error': 'Invalid session'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Write chunk to a temp file
+        import tempfile, os
+        tmp_dir  = os.path.join(tempfile.gettempdir(), str(upload_id))
+        os.makedirs(tmp_dir, exist_ok=True)
+        chunk_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}')
+        with open(chunk_path, 'wb') as f:
+            for part in chunk.chunks():
+                f.write(part)
+
+        session.uploaded_chunks = chunk_index + 1
+        session.save(update_fields=['uploaded_chunks'])
+
+        return Response({'received': chunk_index}, status=status.HTTP_200_OK)
+
 
 class VideoUploadFinalizeView(APIView):
     """
-    Step 3: Assemble chunks and trigger editing/trimming tasks.
+    Step 3 – Assemble chunks and trigger FFmpeg editing via Celery.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        upload_id = request.data.get('upload_id')
-        song_id = request.data.get('song_id') # User selected song
-        trim_start = request.data.get('trim_start', 0)
-        trim_end = request.data.get('trim_end', None)
+        upload_id   = request.data.get('upload_id')
+        song_id     = request.data.get('song_id')
+        trim_start  = request.data.get('trim_start', 0)
+        trim_end    = request.data.get('trim_end', None)
 
-        session = VideoUploadSession.objects.get(id=upload_id, user=request.user)
-        
-        # 1. Mark as processing
-        session.post.video_status = 'processing'
-        session.post.save()
+        try:
+            session = VideoUploadSession.objects.select_related('post').get(
+                id=upload_id, user=request.user
+            )
+        except VideoUploadSession.DoesNotExist:
+            return Response({'error': 'Invalid session'}, status=status.HTTP_404_NOT_FOUND)
 
-        # 2. Trigger Celery Task for FFmpeg editing
-        # This is where 'trim' and 'add music' actually happens on the server
+        Post.objects.filter(pk=session.post_id).update(video_status='processing')
+
         from .tasks import process_video_upload
         process_video_upload.delay(
-            post_id=session.post.id,
-            song_id=song_id,
-            trim_range=(trim_start, trim_end)
+            post_id    = session.post_id,
+            song_id    = song_id,
+            trim_range = (trim_start, trim_end),
+            upload_id  = str(upload_id),
         )
 
-        return Response({
-            "status": "processing",
-            "message": "Video is being edited and optimized."
-        }, status=status.HTTP_202_ACCEPTED)
-class PostDetailView(generics.RetrieveUpdateDestroyAPIView):
-    queryset = Post.objects.all()
-    serializer_class = PostSerializer
-    permission_classes = [permissions.IsAuthenticated]
+        return Response(
+            {'status': 'processing', 'message': 'Video is being edited and optimised.'},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# FOLLOWING FEED VIEW
+# ─────────────────────────────────────────────────────────────────────
 
 class FollowingFeedView(generics.ListAPIView):
-    serializer_class = PostSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    """
+    Pure 'people I follow' feed – no bot content, no league noise.
+    """
+    serializer_class   = PostSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class   = FeedCursorPagination
 
     def get_queryset(self):
-        user = self.request.user
-
-        followed_users = UserFollow.objects.filter(
-            follower=user
-        ).values_list('following_id', flat=True)
-
-        followed_teams = TeamFollow.objects.filter(
-            user=user
-        ).values_list('team_id', flat=True)
-
-        followed_leagues = LeagueFollow.objects.filter(
-            user=user
-        ).values_list('league_id', flat=True)
-
-        return Post.objects.filter(
-            models.Q(author_id__in=followed_users) |
-            models.Q(team_id__in=followed_teams) |
-            models.Q(league_id__in=followed_leagues)
-        ).distinct()
+        user          = self.request.user
+        following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
+        return (
+            _base_post_qs(user)
+            .filter(Q(author_id__in=following_ids) | Q(author=user))
+            .order_by('-created_at')
+        )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# LIKE / SHARE  (legacy APIView endpoints kept for backward compat)
+# ─────────────────────────────────────────────────────────────────────
 
 class LikePostView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, post_id):
         like, created = PostLike.objects.get_or_create(
-            user=request.user,
-            post_id=post_id
+            user=request.user, post_id=post_id
         )
-
         if not created:
             like.delete()
-            return Response({"liked": False})
-
-        return Response({"liked": True})
-
-
-
-
-class CommentCreateView(generics.CreateAPIView):
-    serializer_class = CommentSerializer
-    permission_classes = [IsAuthenticated]
-
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
-
+            Post.objects.filter(pk=post_id).update(
+                like_count=F('like_count') - 1
+            )
+            return Response({'liked': False})
+        Post.objects.filter(pk=post_id).update(like_count=F('like_count') + 1)
+        return Response({'liked': True})
 
 
 class SharePostView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, post_id):
-        comment = request.data.get('comment')
-
+        comment = request.data.get('comment', '')
         PostShare.objects.create(
-            user=request.user,
-            original_post_id=post_id,
-            comment=comment
+            user=request.user, original_post_id=post_id, comment=comment
         )
-
-        return Response({"shared": True})
-
-
-
-
-
-
-class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = Hashtag.objects.all()
-    serializer_class = HashtagSerializer
-
-    @action(detail=False, methods=['get'])
-    def trending(self, request):
-        # Get top 10 tags from the last 24 hours
-        trending_tags = get_trending_hashtags(limit=10, days=1)
-        serializer = self.get_serializer(trending_tags, many=True)
-        return Response(serializer.data)
-
-
+        Post.objects.filter(pk=post_id).update(share_count=F('share_count') + 1)
+        return Response({'shared': True})

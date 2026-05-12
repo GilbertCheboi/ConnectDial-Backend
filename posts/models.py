@@ -1,140 +1,183 @@
 from django.db import models
 from django.conf import settings
+from django.core.cache import cache
 from leagues.models import League, Team
 import uuid
 
-# User helper
 User = settings.AUTH_USER_MODEL
-
-class Post(models.Model):
-    """
-    Represents a user post (text, image, or video) with 
-    native video upload state management.
-    """
-    POST_TYPES = (
-        ('text', 'Text'),
-        ('image', 'Image'),
-        ('video', 'Video'),
-    )
-
-    # Core Fields
-    author = models.ForeignKey(
-        User,
-        on_delete=models.CASCADE,
-        related_name='posts'
-    )
-    content = models.TextField(blank=True, null=True)
-    post_type = models.CharField(max_length=10, choices=POST_TYPES, default='text')
-    media_file = models.FileField(upload_to='post_media/', blank=True, null=True)
-    league = models.ForeignKey(
-        League,
-        on_delete=models.CASCADE,
-        related_name='posts'
-    )
-    team = models.ForeignKey(
-        Team,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='posts'
-    )
-
-    # Native Video Management
-    is_short = models.BooleanField(default=False)
-    VIDEO_STATUS_CHOICES = [
-        ('none', 'No Video'),
-        ('pending', 'Uploading'),
-        ('processing', 'Trimming/Adding Music'),
-        ('ready', 'Ready to View'),
-        ('failed', 'Error Processing'),
-    ]
-    video_status = models.CharField(
-        max_length=20, 
-        choices=VIDEO_STATUS_CHOICES, 
-        default='none'
-    )
-    duration = models.PositiveIntegerField(
-        default=0, 
-        help_text="Duration in seconds"
-    )
-
-    # Social Features
-    mentions = models.ManyToManyField(
-        User, 
-        related_name='mentioned_in', 
-        blank=True
-    )
-    hashtags = models.ManyToManyField(
-        'Hashtag',
-        blank=True,
-        related_name='posts'
-    )
-    parent_post = models.ForeignKey(
-        'self', 
-        on_delete=models.SET_NULL, 
-        null=True, 
-        blank=True, 
-        related_name='quoted_by'
-    )
-    is_repost = models.BooleanField(default=False)
-
-    # Counters for Feed Algorithm
-    view_count = models.PositiveIntegerField(default=0)
-    like_count = models.PositiveIntegerField(default=0)
-    comment_count = models.PositiveIntegerField(default=0)
-    share_count = models.PositiveIntegerField(default=0)
-
-    # Timestamps
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        ordering = ['-created_at']
-
-    def __str__(self):
-        return f"{self.author.username} - {self.post_type} - {self.league.name}"
-
-
-class VideoUploadSession(models.Model):
-    """
-    Recommended: Track chunked uploads separately to 
-    prevent corrupting Post objects if upload fails.
-    """
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    post = models.OneToOneField(Post, on_delete=models.CASCADE, related_name='upload_session')
-    total_chunks = models.PositiveIntegerField(default=0)
-    uploaded_chunks = models.PositiveIntegerField(default=0)
-    status = models.CharField(max_length=20, default='initiated')
-    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Hashtag(models.Model):
-    name = models.CharField(max_length=100, unique=True)
+    name = models.CharField(max_length=100, unique=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['name']),
+        ]
 
     def __str__(self):
         return f"#{self.name}"
 
 
+class Post(models.Model):
+    """
+    Represents a user post (text, image, or video) with
+    native video upload state management and hot-score caching.
+    """
+    POST_TYPES = (
+        ('text',  'Text'),
+        ('image', 'Image'),
+        ('video', 'Video'),
+    )
+    VIDEO_STATUS_CHOICES = [
+        ('none',       'No Video'),
+        ('pending',    'Uploading'),
+        ('processing', 'Trimming/Adding Music'),
+        ('ready',      'Ready to View'),
+        ('failed',     'Error Processing'),
+    ]
+
+    # ── Core ──────────────────────────────────────────────────────────
+    author = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='posts', db_index=True
+    )
+    content    = models.TextField(blank=True, null=True)
+    post_type  = models.CharField(max_length=10, choices=POST_TYPES, default='text')
+    media_file = models.FileField(upload_to='post_media/', blank=True, null=True)
+    league = models.ForeignKey(
+        League, on_delete=models.CASCADE, related_name='posts', db_index=True
+    )
+    team = models.ForeignKey(
+        Team, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='posts', db_index=True
+    )
+
+    # ── Native Video ──────────────────────────────────────────────────
+    is_short     = models.BooleanField(default=False, db_index=True)
+    video_status = models.CharField(
+        max_length=20, choices=VIDEO_STATUS_CHOICES, default='none', db_index=True
+    )
+    duration = models.PositiveIntegerField(default=0, help_text="Duration in seconds")
+
+    # ── Social Features ───────────────────────────────────────────────
+    mentions = models.ManyToManyField(
+        User, related_name='mentioned_in', blank=True
+    )
+    hashtags = models.ManyToManyField(
+        'Hashtag', blank=True, related_name='posts'
+    )
+    parent_post = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='quoted_by', db_index=True
+    )
+    is_repost = models.BooleanField(default=False)
+
+    # ── Denormalised counters (updated atomically via F()) ────────────
+    # These power the hot-score algorithm WITHOUT extra DB aggregations.
+    view_count    = models.PositiveIntegerField(default=0)
+    like_count    = models.PositiveIntegerField(default=0)
+    comment_count = models.PositiveIntegerField(default=0)
+    share_count   = models.PositiveIntegerField(default=0)
+
+    # ── Timestamps ────────────────────────────────────────────────────
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            # composite index for the home-feed query
+            models.Index(fields=['league', '-created_at']),
+            # composite index for profile queries
+            models.Index(fields=['author', '-created_at']),
+            # shorts feed
+            models.Index(fields=['is_short', 'video_status', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.author_id} – {self.post_type} – {self.league_id}"
+
+    # ── Cached absolute media URL ─────────────────────────────────────
+    def get_media_url(self, request=None):
+        if not self.media_file:
+            return None
+        url = self.media_file.url
+        if request:
+            return request.build_absolute_uri(url)
+        return url
+
+    # ── Atomic counter helpers ────────────────────────────────────────
+    def increment_view(self):
+        Post.objects.filter(pk=self.pk).update(view_count=models.F('view_count') + 1)
+
+    def increment_like(self):
+        Post.objects.filter(pk=self.pk).update(like_count=models.F('like_count') + 1)
+
+    def decrement_like(self):
+        Post.objects.filter(pk=self.pk).update(
+            like_count=models.Case(
+                models.When(like_count__gt=0, then=models.F('like_count') - 1),
+                default=models.Value(0),
+                output_field=models.PositiveIntegerField(),
+            )
+        )
+
+    def increment_comment(self):
+        Post.objects.filter(pk=self.pk).update(comment_count=models.F('comment_count') + 1)
+
+    def decrement_comment(self):
+        Post.objects.filter(pk=self.pk).update(
+            comment_count=models.Case(
+                models.When(comment_count__gt=0, then=models.F('comment_count') - 1),
+                default=models.Value(0),
+                output_field=models.PositiveIntegerField(),
+            )
+        )
+
+    def increment_share(self):
+        Post.objects.filter(pk=self.pk).update(share_count=models.F('share_count') + 1)
+
+
+class VideoUploadSession(models.Model):
+    """
+    Tracks chunked uploads separately to avoid corrupting Post objects.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user      = models.ForeignKey(User, on_delete=models.CASCADE)
+    post      = models.OneToOneField(Post, on_delete=models.CASCADE, related_name='upload_session')
+    total_chunks    = models.PositiveIntegerField(default=0)
+    uploaded_chunks = models.PositiveIntegerField(default=0)
+    status    = models.CharField(max_length=20, default='initiated')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class PostLike(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
-    post = models.ForeignKey('Post', on_delete=models.CASCADE, related_name='likes')
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='likes')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ('user', 'post')
+        indexes = [
+            models.Index(fields=['post', 'user']),
+        ]
 
 
 class Comment(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    post = models.ForeignKey(Post, related_name='comments', on_delete=models.CASCADE)
+    user    = models.ForeignKey(User, on_delete=models.CASCADE, db_index=True)
+    post    = models.ForeignKey(Post, related_name='comments', on_delete=models.CASCADE, db_index=True)
     content = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['post', '-created_at']),
+        ]
+
 
 class CommentLike(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    user    = models.ForeignKey(User, on_delete=models.CASCADE)
     comment = models.ForeignKey(Comment, related_name='likes', on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -143,7 +186,7 @@ class CommentLike(models.Model):
 
 
 class PostShare(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    original_post = models.ForeignKey('Post', on_delete=models.CASCADE, related_name='shares')
-    comment = models.TextField(blank=True, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
+    user          = models.ForeignKey(User, on_delete=models.CASCADE)
+    original_post = models.ForeignKey(Post, on_delete=models.CASCADE, related_name='shares')
+    comment       = models.TextField(blank=True, null=True)
+    created_at    = models.DateTimeField(auto_now_add=True)

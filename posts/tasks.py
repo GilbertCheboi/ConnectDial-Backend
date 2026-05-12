@@ -1,221 +1,398 @@
+"""
+tasks.py – ConnectDial Celery tasks
+────────────────────────────────────
+• sync_bots_with_live_sports      – NewsAPI → AI caption → bot post
+• fetch_and_post_youtube_shorts   – YouTube highlights → bot short
+• coordinate_bot_engagement       – schedule per-post engagement
+• perform_single_post_engagement  – like / comment / repost
+• expand_bot_social_graph         – bots follow same-league users
+• process_video_upload            – FFmpeg trim + music (server-side)
+"""
+
+import os
 import random
-import requests
+import tempfile
 import time
+
+import requests
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.db.models import F
 from django.utils import timezone
 
-from .models import Post, PostLike, Comment, Hashtag
-from leagues.models import League
+from .models import Comment, Hashtag, Post, PostLike, VideoUploadSession
 from .ai_utils import generate_intelligent_caption
+from leagues.models import League
 
 User = get_user_model()
 
-# --- 1. CONTENT GENERATION TASKS ---
+# ─────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────
 
-@shared_task(name="posts.tasks.sync_bots_with_live_sports")
-def sync_bots_with_live_sports(league_name, bot_count=3):
-    """
-    Fetches latest news via NewsAPI and has league-specific bots create posts.
-    """
+def _get_league(league_name: str):
     league = League.objects.filter(name__icontains=league_name).first()
     if not league:
-        return f"Skip: {league_name} not found in DB."
+        raise ValueError(f"League '{league_name}' not found in DB.")
+    return league
 
-    query = f"{league_name} sports highlights"
-    news_url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&language=en&apiKey={settings.NEWS_API_KEY}"
-    
+
+def _safe_get(url: str, timeout: int = 10) -> requests.Response:
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 1. NEWS → BOT POSTS
+# ─────────────────────────────────────────────────────────────────────
+
+@shared_task(
+    name='posts.tasks.sync_bots_with_live_sports',
+    bind=True,
+    max_retries=2,
+    default_retry_delay=60,
+)
+def sync_bots_with_live_sports(self, league_name: str, bot_count: int = 3):
+    """
+    1. Fetch latest news from NewsAPI for the league.
+    2. Pick N league-specific bots.
+    3. Generate AI captions and create Posts.
+    """
     try:
-        response = requests.get(news_url, timeout=10).json()
-        articles = response.get('articles', [])
-        if not articles:
-            return f"No news for {league_name}"
-        article = random.choice(articles[:5]) 
-    except Exception as e:
-        return f"API Error for {league_name}: {str(e)}"
+        league = _get_league(league_name)
+    except ValueError as e:
+        return str(e)
 
-    # CRITICAL FIX: Only select bots that actually have this as their favorite league.
-    # Removed the fallback to ensure F1 bots don't post about Premier League.
-    bots = User.objects.filter(
-        profile__is_bot=True, 
-        favorite_league=league
-    ).order_by('?')[:bot_count]
-    
-    if not bots.exists():
-        return f"Skip: No specific bots found for {league_name}. Keeping personas consistent."
+    url = (
+        f"https://newsapi.org/v2/everything"
+        f"?q={league_name}+sports+highlights"
+        f"&sortBy=publishedAt&language=en"
+        f"&apiKey={settings.NEWS_API_KEY}"
+    )
 
+    try:
+        articles = _safe_get(url).json().get('articles', [])
+    except Exception as exc:
+        return self.retry(exc=exc)
+
+    if not articles:
+        return f"No news for {league_name}"
+
+    article = random.choice(articles[:5])
+
+    bots = list(
+        User.objects.filter(
+            profile__is_bot=True,
+            favorite_league=league,
+        ).select_related('favorite_team').order_by('?')[:bot_count]
+    )
+
+    if not bots:
+        return f"No bots found for {league_name}"
+
+    created = 0
     for bot in bots:
-        # Rate limit protection for Gemini API
-        time.sleep(2) 
-        
+        time.sleep(2)  # respect Gemini rate limit
         personality = random.choice(['hype', 'toxic', 'analytical', 'funny'])
-        
         caption = generate_intelligent_caption(
             news_title=article['title'],
             news_desc=article.get('description', ''),
             league=league.name,
             team=bot.favorite_team.name if bot.favorite_team else None,
-            personality=personality
+            personality=personality,
         )
 
         post = Post.objects.create(
-            author=bot,
-            content=caption,
-            post_type='image' if article.get('urlToImage') else 'text',
-            league=league,
-            team=bot.favorite_team
+            author    = bot,
+            content   = caption,
+            post_type = 'image' if article.get('urlToImage') else 'text',
+            league    = league,
+            team      = bot.favorite_team,
         )
 
         image_url = article.get('urlToImage')
         if image_url:
             try:
-                img_res = requests.get(image_url, timeout=5)
-                if img_res.status_code == 200:
-                    post.media_file.save(f"bot_{post.id}.jpg", ContentFile(img_res.content), save=True)
+                img_bytes = _safe_get(image_url, timeout=5).content
+                post.media_file.save(f"bot_{post.id}.jpg", ContentFile(img_bytes), save=True)
             except Exception:
                 pass
 
-    return f"Leagues Processed: {league_name} ({len(bots)} bots posted)"
+        created += 1
+
+    return f"{league_name}: {created} bot posts created."
 
 
-@shared_task(name="posts.tasks.fetch_and_post_youtube_shorts")
-def fetch_and_post_youtube_shorts(league_name):
-    """
-    Finds real broadcast highlights on YouTube and posts them.
-    """
-    API_KEY = settings.YOUTUBE_API_KEY
-    league = League.objects.filter(name__icontains=league_name).first()
-    if not league: 
-        return f"League {league_name} not found."
+# ─────────────────────────────────────────────────────────────────────
+# 2. YOUTUBE SHORTS → BOT POSTS
+# ─────────────────────────────────────────────────────────────────────
 
-    # CRITICAL FIX: Ensure we pick a bot that actually likes this league
-    bot_user = User.objects.filter(
-        profile__is_bot=True, 
-        favorite_league=league
-    ).order_by('?').first()
-    
-    if not bot_user:
-        return f"Skip: No {league_name} bot found for Shorts."
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
-    query = f"{league_name} official highlights"                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
-    # CHANGE: videoDuration='any' because official clips often exceed 60 seconds
+@shared_task(
+    name='posts.tasks.fetch_and_post_youtube_shorts',
+    bind=True,
+    max_retries=2,
+    default_retry_delay=120,
+)
+def fetch_and_post_youtube_shorts(self, league_name: str):
+    try:
+        league = _get_league(league_name)
+    except ValueError as e:
+        return str(e)
+
+    bot = (
+        User.objects
+        .filter(profile__is_bot=True, favorite_league=league)
+        .select_related('favorite_team')
+        .order_by('?')
+        .first()
+    )
+    if not bot:
+        return f"No bot for {league_name}"
+
     url = (
-        f"https://www.googleapis.com/youtube/v3/search?part=snippet"
-        f"&q={query}&type=video&videoDuration=any&maxResults=10"
-        f"&key={API_KEY}"
+        f"https://www.googleapis.com/youtube/v3/search"
+        f"?part=snippet&q={league_name}+official+highlights"
+        f"&type=video&videoDuration=any&maxResults=10"
+        f"&key={settings.YOUTUBE_API_KEY}"
     )
 
     try:
-        res = requests.get(url, timeout=15).json()
-        items = res.get('items', [])
-        if not items: 
-            return f"No YouTube clips found for {league_name}."
+        items = _safe_get(url, timeout=15).json().get('items', [])
+    except Exception as exc:
+        return self.retry(exc=exc)
 
-        video_data = random.choice(items)
-        video_id = video_data['id']['videoId']
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
+    if not items:
+        return f"No YouTube clips for {league_name}"
 
-        # Rate limit protection
-        time.sleep(2)
+    item       = random.choice(items)
+    video_id   = item['id']['videoId']
+    video_url  = f"https://www.youtube.com/watch?v={video_id}"
 
-        ai_caption = generate_intelligent_caption(
-            news_title=video_data['snippet']['title'],
-            news_desc="Broadcast highlight",
-            league=league.name,
-            personality=random.choice(['hype', 'funny', 'analytical'])
-        )
+    time.sleep(2)
+    caption = generate_intelligent_caption(
+        news_title=item['snippet']['title'],
+        news_desc='Broadcast highlight',
+        league=league.name,
+        personality=random.choice(['hype', 'funny', 'analytical']),
+    )
 
-        new_post = Post.objects.create(
-            author=bot_user,
-            content=f"{ai_caption}\n\n{video_url}",
-            post_type='video',
-            league=league,
-            team=bot_user.favorite_team,
-            is_short=True
-        )
+    post = Post.objects.create(
+        author    = bot,
+        content   = f"{caption}\n\n{video_url}",
+        post_type = 'video',
+        league    = league,
+        team      = bot.favorite_team,
+        is_short  = True,
+    )
 
-        for t in [league.name.replace(" ", ""), "Highlights", "ConnectDial"]:
-            tag_obj, _ = Hashtag.objects.get_or_create(name=t)
-            new_post.hashtags.add(tag_obj)
+    for tag_name in [league.name.replace(' ', ''), 'Highlights', 'ConnectDial']:
+        tag, _ = Hashtag.objects.get_or_create(name=tag_name.lower())
+        post.hashtags.add(tag)
 
-        return f"📺 YouTube Short: @{bot_user.username} shared {video_id}"
-    except Exception as e:
-        return f"YouTube API Error: {str(e)}"
+    return f"@{bot.username} posted YouTube short {video_id}"
 
-# --- 2. SOCIAL INTERACTION TASKS ---
 
-@shared_task(name="posts.tasks.coordinate_bot_engagement")
+# ─────────────────────────────────────────────────────────────────────
+# 3. COORDINATE BOT ENGAGEMENT
+# ─────────────────────────────────────────────────────────────────────
+
+@shared_task(name='posts.tasks.coordinate_bot_engagement')
 def coordinate_bot_engagement():
-    recent_posts = Post.objects.filter(
-        created_at__gte=timezone.now() - timezone.timedelta(minutes=60)
-    ).select_related('league', 'author')
+    """
+    Finds recent posts and schedules delayed engagement for realism.
+    """
+    cutoff = timezone.now() - timezone.timedelta(hours=1)
+    post_ids = list(
+        Post.objects
+        .filter(created_at__gte=cutoff)
+        .values_list('id', flat=True)
+    )
+    for pid in post_ids:
+        perform_single_post_engagement.apply_async(
+            args=[pid],
+            countdown=random.randint(300, 43200),  # 5 min – 12 hours
+        )
+    return f"Scheduled engagement for {len(post_ids)} posts."
 
-    for post in recent_posts:
-        delay = 12 * 3600  # 12 hours in seconds
-        perform_single_post_engagement.apply_async(args=[post.id], countdown=delay)
 
-    return f"Coordinated engagement for {recent_posts.count()} posts."
+# ─────────────────────────────────────────────────────────────────────
+# 4. SINGLE-POST BOT ENGAGEMENT
+# ─────────────────────────────────────────────────────────────────────
 
-
-@shared_task(name="posts.tasks.perform_single_post_engagement")
-def perform_single_post_engagement(post_id):
+@shared_task(name='posts.tasks.perform_single_post_engagement')
+def perform_single_post_engagement(post_id: int):
     try:
-        post = Post.objects.get(id=post_id)
-        # Bots only engage with posts in their favorite league
-        eligible_bots = User.objects.filter(
-            profile__is_bot=True,
-            favorite_league=post.league
-        ).exclude(id=post.author.id)
-
-        if not eligible_bots.exists():
-            return f"No matching bots for post {post_id} league."
-
-        participants = eligible_bots.order_by('?')[:random.randint(1, 2)]
-
-        for bot in participants:
-            action = random.choice(['like', 'comment', 'repost'])
-            if action == 'like':
-                PostLike.objects.get_or_create(user=bot, post=post)
-            elif action == 'comment':
-                time.sleep(2)
-                ai_comment = generate_intelligent_caption(
-                    news_title=post.content[:100],
-                    news_desc="User generated post",
-                    league=post.league.name if post.league else "Sports",
-                    personality=random.choice(['hype', 'funny', 'analytical'])
-                )
-                Comment.objects.create(user=bot, post=post, content=ai_comment)
-            elif action == 'repost':
-                Post.objects.create(
-                    author=bot,
-                    content=f"Check this out! #{post.league.name.replace(' ', '') if post.league else 'Sports'}",
-                    post_type='text',
-                    league=post.league,
-                    parent_post=post,
-                    is_repost=True
-                )
-        return f"Engaged with Post {post_id}"
+        post = Post.objects.select_related('league', 'author').get(id=post_id)
     except Post.DoesNotExist:
-        return "Post not found."
+        return f"Post {post_id} not found."
+
+    eligible = list(
+        User.objects.filter(
+            profile__is_bot=True,
+            favorite_league=post.league,
+        )
+        .exclude(id=post.author_id)
+        .select_related('favorite_team')
+        .order_by('?')[:random.randint(1, 3)]
+    )
+
+    if not eligible:
+        return f"No bots for post {post_id}."
+
+    for bot in eligible:
+        action = random.choice(['like', 'comment', 'repost'])
+
+        if action == 'like':
+            _, created = PostLike.objects.get_or_create(user=bot, post=post)
+            if created:
+                post.increment_like()
+
+        elif action == 'comment':
+            time.sleep(2)
+            ai_comment = generate_intelligent_caption(
+                news_title=post.content[:100],
+                news_desc='User generated post',
+                league=post.league.name if post.league else 'Sports',
+                personality=random.choice(['hype', 'funny', 'analytical']),
+            )
+            Comment.objects.create(user=bot, post=post, content=ai_comment)
+            post.increment_comment()
+
+        elif action == 'repost':
+            league_tag = post.league.name.replace(' ', '') if post.league else 'Sports'
+            Post.objects.create(
+                author      = bot,
+                content     = f"Check this out! #{league_tag}",
+                post_type   = 'text',
+                league      = post.league,
+                parent_post = post,
+                is_repost   = True,
+            )
+
+    return f"Engaged with post {post_id} ({len(eligible)} bots)"
 
 
-@shared_task(name="posts.tasks.expand_bot_social_graph")
-def expand_bot_social_graph(batch_size=10):
-    from users.models import Follow 
-    
-    bots = User.objects.filter(profile__is_bot=True).order_by('?')[:batch_size]
+# ─────────────────────────────────────────────────────────────────────
+# 5. EXPAND BOT SOCIAL GRAPH
+# ─────────────────────────────────────────────────────────────────────
 
+@shared_task(name='posts.tasks.expand_bot_social_graph')
+def expand_bot_social_graph(batch_size: int = 10):
+    from users.models import Follow
+
+    bots = list(
+        User.objects
+        .filter(profile__is_bot=True)
+        .select_related('favorite_league')
+        .order_by('?')[:batch_size]
+    )
+
+    followed = 0
     for bot in bots:
-        potential_targets = User.objects.filter(
-            favorite_league=bot.favorite_league
-        ).exclude(id=bot.id).exclude(
-            followers__follower=bot 
-        ).order_by('profile__is_bot', '?') 
-
-        target = potential_targets.first()
+        target = (
+            User.objects
+            .filter(favorite_league=bot.favorite_league)
+            .exclude(id=bot.id)
+            .exclude(followers__follower=bot)
+            .order_by('profile__is_bot', '?')
+            .first()
+        )
         if target:
             Follow.objects.get_or_create(follower=bot, followed=target)
-            
-    return f"Social graph expanded for {len(bots)} bots."
+            followed += 1
+
+    return f"Social graph expanded: {followed} new follows."
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 6. VIDEO PROCESSING  (FFmpeg)
+# ─────────────────────────────────────────────────────────────────────
+
+@shared_task(
+    name='posts.tasks.process_video_upload',
+    bind=True,
+    max_retries=1,
+)
+def process_video_upload(self, post_id: int, song_id=None, trim_range=(0, None), upload_id=None):
+    """
+    1. Assemble temp chunks into a single file.
+    2. Run FFmpeg trim + (optional) audio overlay.
+    3. Save to Post.media_file and mark video_status='ready'.
+    """
+    import subprocess
+    from django.core.files import File
+
+    try:
+        post = Post.objects.get(id=post_id)
+    except Post.DoesNotExist:
+        return f"Post {post_id} not found."
+
+    tmp_dir    = os.path.join(tempfile.gettempdir(), str(upload_id or post_id))
+    raw_path   = os.path.join(tmp_dir, 'assembled.mp4')
+    output_path = os.path.join(tmp_dir, 'output.mp4')
+
+    try:
+        # ── Assemble chunks ──────────────────────────────────────────
+        chunk_files = sorted(
+            [f for f in os.listdir(tmp_dir) if f.startswith('chunk_')]
+        )
+        with open(raw_path, 'wb') as outfile:
+            for chunk_name in chunk_files:
+                with open(os.path.join(tmp_dir, chunk_name), 'rb') as cf:
+                    outfile.write(cf.read())
+
+        # ── Build FFmpeg command ─────────────────────────────────────
+        trim_start = trim_range[0] or 0
+        trim_end   = trim_range[1]
+
+        vf_filters = 'scale=720:-2'  # 720p for mobile
+        cmd = ['ffmpeg', '-y', '-i', raw_path]
+
+        if trim_start:
+            cmd += ['-ss', str(trim_start)]
+        if trim_end:
+            cmd += ['-to', str(trim_end)]
+
+        if song_id:
+            # Future: resolve song path from DB
+            # song_path = Song.objects.get(id=song_id).file.path
+            # cmd += ['-i', song_path, '-map', '0:v', '-map', '1:a', '-shortest']
+            pass
+
+        cmd += [
+            '-vf', vf_filters,
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '28',
+            '-movflags', '+faststart',  # enables streaming before full download
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            output_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {result.stderr}")
+
+        # ── Save to Django media storage ─────────────────────────────
+        with open(output_path, 'rb') as f:
+            post.media_file.save(f"video_{post_id}.mp4", File(f), save=False)
+
+        Post.objects.filter(pk=post_id).update(
+            video_status='ready',
+            media_file=post.media_file.name,
+        )
+
+    except Exception as exc:
+        Post.objects.filter(pk=post_id).update(video_status='failed')
+        raise self.retry(exc=exc)
+
+    finally:
+        # Cleanup temp files
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return f"Video {post_id} processed successfully."
