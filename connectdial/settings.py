@@ -27,8 +27,10 @@ ALLOWED_HOSTS = [
     '192.168.100.108',
     '10.199.198.201',
     '10.199.198.22',
-    'api.connectdial.com',
-    '16.16.98.131',          # plain IP — no scheme
+   # plain IP — no scheme
+    'dev.connectdial.com',
+    '51.20.182.163',
+    '*',
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -187,21 +189,17 @@ GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 5  # 5 MB
 # CORS
 # ======================
 CORS_ALLOWED_ORIGINS = [
-    'http://16.16.98.131',
-    'https://16.16.98.131',
-    'http://api.connectdial.com',
-    'https://api.connectdial.com',
+    'http://51.20.182.163',
+    'https://51.20.182.163',
+    'http://dev.connectdial.com',
+    'https://dev.connectdial.com',
 ]
-CORS_ALLOW_CREDENTIALS = True
 
-# ======================
-# CSRF
-# ======================
 CSRF_TRUSTED_ORIGINS = [
-    'http://16.16.98.131',
-    'https://16.16.98.131',
-    'http://api.connectdial.com',
-    'https://api.connectdial.com',
+    'http://51.20.182.163',
+    'https://51.20.182.163',
+    'http://dev.connectdial.com',
+    'https://dev.connectdial.com',
 ]
 
 # ======================
