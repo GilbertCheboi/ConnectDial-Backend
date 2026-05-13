@@ -11,7 +11,7 @@ Design principles:
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
-from .models import Post, Comment, Hashtag, PostLike, PostShare
+from .models import Post, PostMedia, Comment, Hashtag, PostLike, PostShare
 from users.models import Follow
 
 User = get_user_model()
@@ -45,18 +45,14 @@ class SupportLogicMixin:
         if not user:
             return None
 
-        # News / organisation accounts are neutral
         if getattr(user, 'account_type', None) in ('news', 'organization'):
             return None
 
-        # Determine the league context
         target_league = getattr(obj, 'league', None)
         if not target_league and hasattr(obj, 'post'):
             target_league = getattr(obj.post, 'league', None)
 
-        # Contextual: show team for the specific league of the post
         if target_league:
-            # fan_preferences should be prefetched – no extra query
             pref = next(
                 (p for p in user.fan_preferences.all() if p.league_id == target_league.id),
                 None,
@@ -69,7 +65,6 @@ class SupportLogicMixin:
                     'type':        'contextual',
                 }
 
-        # Global fallback: overall favourite team
         fav_team   = getattr(user, 'favorite_team', None)
         fav_league = getattr(user, 'favorite_league', None)
         if fav_team:
@@ -96,24 +91,39 @@ class HashtagSerializer(serializers.ModelSerializer):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# AUTHOR DETAIL (reusable dict, not a nested serializer,
-# so we avoid instantiating a ModelSerializer per row)
+# POST MEDIA
+# ─────────────────────────────────────────────────────────────────────
+
+class PostMediaSerializer(serializers.ModelSerializer):
+    """
+    Serialises each file attached to a post.
+    Returns an absolute URL so the frontend can use it directly.
+    """
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model  = PostMedia
+        fields = ['id', 'file_url', 'media_type', 'order']
+
+    def get_file_url(self, obj):
+        request = self.context.get('request')
+        return _build_url(request, obj.file)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# AUTHOR DETAIL (reusable dict, not a nested serializer)
 # ─────────────────────────────────────────────────────────────────────
 
 def _author_dict(user, request, viewer=None):
     """
     Build the author detail dict.
-    viewer: the currently authenticated user (to compute is_following).
     All data comes from objects already in memory (select_related).
     """
     profile     = getattr(user, 'profile', None)
     profile_pic = _build_url(request, getattr(profile, 'profile_image', None))
 
-    # is_following: use the prefetched annotation if available, else skip
     is_following = False
     if viewer and viewer.is_authenticated and viewer.pk != user.pk:
-        # If the view annotated 'is_following_author' we can read it directly;
-        # otherwise fall back to a single EXISTS query (only for edge cases).
         is_following = getattr(user, '_is_following', False)
 
     return {
@@ -133,28 +143,34 @@ def _author_dict(user, request, viewer=None):
 # ─────────────────────────────────────────────────────────────────────
 
 class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
-    # These are populated from the annotated queryset (no extra DB calls)
+    # Counters from denormalised fields / annotations
     likes_count    = serializers.IntegerField(source='like_count',    read_only=True, default=0)
     comments_count = serializers.IntegerField(source='comment_count', read_only=True, default=0)
     shares_count   = serializers.IntegerField(source='share_count',   read_only=True, default=0)
-    reposts_count  = serializers.IntegerField(read_only=True, default=0)  # annotated in view
+    reposts_count  = serializers.IntegerField(read_only=True, default=0)
 
-    author_details   = serializers.SerializerMethodField()
-    supporting_info  = serializers.SerializerMethodField()
-    is_owner         = serializers.SerializerMethodField()
-    liked_by_me      = serializers.SerializerMethodField()
-    original_post    = serializers.SerializerMethodField()
-    league_details   = serializers.SerializerMethodField()
-    team_details     = serializers.SerializerMethodField()
-    media_url        = serializers.SerializerMethodField()
-    # Expose raw video_status so the frontend can render correct player UI
-    video_status     = serializers.CharField(read_only=True)
+    author_details  = serializers.SerializerMethodField()
+    supporting_info = serializers.SerializerMethodField()
+    is_owner        = serializers.SerializerMethodField()
+    liked_by_me     = serializers.SerializerMethodField()
+    original_post   = serializers.SerializerMethodField()
+    league_details  = serializers.SerializerMethodField()
+    team_details    = serializers.SerializerMethodField()
+    media_url       = serializers.SerializerMethodField()
+    video_status    = serializers.CharField(read_only=True)
+
+    # ✅ NEW: multiple media files (images/videos)
+    media_files = PostMediaSerializer(many=True, read_only=True)
 
     class Meta:
         model  = Post
         fields = [
             'id', 'author_details', 'content', 'is_short', 'post_type',
-            'media_file', 'media_url', 'video_status', 'duration',
+            # media_file kept for backward compat (shorts single video)
+            'media_file', 'media_url',
+            # new multi-media list
+            'media_files',
+            'video_status', 'duration',
             'league', 'league_details', 'team', 'team_details',
             'supporting_info', 'likes_count', 'comments_count',
             'shares_count', 'reposts_count', 'view_count', 'liked_by_me',
@@ -168,6 +184,10 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
     # ── SerializerMethodFields ────────────────────────────────────────
 
     def get_media_url(self, obj):
+        """
+        Returns the absolute URL for the legacy single media_file.
+        Frontend should prefer media_files[] for new posts.
+        """
         request = self.context.get('request')
         return _build_url(request, obj.media_file)
 
@@ -178,11 +198,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
         return False
 
     def get_liked_by_me(self, obj):
-        """
-        Prefer the annotated value from the queryset (zero extra queries).
-        Fall back to a DB hit only if annotation is missing.
-        """
-        # Annotated by get_home_feed_queryset
+        """Prefer annotated value; fall back to DB query."""
         annotated = getattr(obj, 'liked_by_me', None)
         if annotated is not None:
             return bool(annotated)
@@ -210,11 +226,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
         return None
 
     def get_original_post(self, obj):
-        """
-        Recursive serialisation for reposts/quotes.
-        parent_post is select_related, so no extra query.
-        Capped at one level of recursion to avoid deep nesting.
-        """
+        """Recursive serialisation for reposts/quotes (capped at 1 level)."""
         if obj.parent_post_id and obj.parent_post:
             return PostSerializer(obj.parent_post, context=self.context).data
         return None
@@ -262,7 +274,6 @@ class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
         return False
 
     def get_likes_count(self, obj):
-        # If annotated, use it; otherwise fall back
         annotated = getattr(obj, 'likes_count', None)
         if annotated is not None:
             return annotated

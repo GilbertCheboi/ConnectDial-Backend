@@ -27,7 +27,7 @@ from rest_framework.views import APIView
 
 from users.models import Follow, FanPreference
 
-from .models import Comment, Hashtag, Post, PostLike, PostShare, VideoUploadSession
+from .models import Comment, Hashtag, Post, PostLike, PostMedia, PostShare, VideoUploadSession
 from .serializers import CommentSerializer, HashtagSerializer, PostSerializer
 from .services import get_personalized_shorts, get_trending_hashtags
 
@@ -37,22 +37,15 @@ from .services import get_personalized_shorts, get_trending_hashtags
 # ─────────────────────────────────────────────────────────────────────
 
 class FeedCursorPagination(CursorPagination):
-    """
-    Cursor pagination for the main feed.
-    No COUNT(*) → instant response on large tables.
-    """
-    page_size            = 20
+    page_size             = 20
     page_size_query_param = 'page_size'
-    max_page_size        = 50
-    ordering             = '-created_at'
+    max_page_size         = 50
+    ordering              = '-created_at'
 
 
 class ShortsCursorPagination(CursorPagination):
-    """
-    Shorts use hot_score ordering so the cursor must reflect that.
-    """
     page_size = 10
-    ordering  = '-created_at'   # hot_score is recalculated; cursor on created_at is stable
+    ordering  = '-created_at'
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -68,7 +61,7 @@ class IsAuthorOrReadOnly(permissions.BasePermission):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# BASE QUERYSET BUILDER  (shared by PostViewSet + FollowingFeedView)
+# BASE QUERYSET BUILDER
 # ─────────────────────────────────────────────────────────────────────
 
 def _base_post_qs(user):
@@ -77,6 +70,7 @@ def _base_post_qs(user):
     • 1 SQL with all JOINs
     • Exists() sub-query for liked_by_me (no loop)
     • Uses denormalised counters (no COUNT aggregation)
+    • Prefetches media_files so PostMediaSerializer has zero extra queries
     """
     like_sq = PostLike.objects.filter(post=OuterRef('pk'), user=user)
 
@@ -97,10 +91,11 @@ def _base_post_qs(user):
             'hashtags',
             'author__fan_preferences__league',
             'author__fan_preferences__team',
+            # ✅ NEW: prefetch all attached media files (zero extra queries per post)
+            'media_files',
         )
         .annotate(
             liked_by_me=Exists(like_sq),
-            # reposts_count from the 'quoted_by' reverse relation
             reposts_count=Count('quoted_by', distinct=True),
         )
     )
@@ -131,7 +126,6 @@ class PostViewSet(viewsets.ModelViewSet):
         team_id      = params.get('team')
         feed_type    = params.get('feed_type')
 
-        # ── A. Default: only leagues the user follows ─────────────────
         if user.is_authenticated and not league_id and not leagues_list:
             league_ids = list(
                 user.fan_preferences.values_list('league_id', flat=True)
@@ -139,7 +133,6 @@ class PostViewSet(viewsets.ModelViewSet):
             if league_ids:
                 qs = qs.filter(league_id__in=league_ids)
 
-        # ── B. Explicit league filter ─────────────────────────────────
         if league_id:
             qs = qs.filter(league_id=league_id)
         elif leagues_list:
@@ -147,12 +140,10 @@ class PostViewSet(viewsets.ModelViewSet):
             if ids:
                 qs = qs.filter(league_id__in=ids)
 
-        # ── C. Following-only feed ────────────────────────────────────
         if feed_type == 'following' and user.is_authenticated:
             following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
             qs = qs.filter(Q(author_id__in=following_ids) | Q(author=user))
 
-        # ── D. Profile / context filters ─────────────────────────────
         if user_id:
             qs = qs.filter(author_id=user_id)
         elif filter_type == 'mine' and user.is_authenticated:
@@ -166,11 +157,59 @@ class PostViewSet(viewsets.ModelViewSet):
     # ── Create ────────────────────────────────────────────────────────
 
     def perform_create(self, serializer):
-        parent_id = self.request.data.get('parent_post')
-        kwargs    = {'author': self.request.user}
+        parent_id   = self.request.data.get('parent_post')
+        media_files = self.request.FILES.getlist('media_files')  # ✅ all uploaded files
+
+        kwargs = {'author': self.request.user}
+
         if parent_id:
             kwargs['parent_post_id'] = parent_id
-        serializer.save(**kwargs)
+
+        # Determine post_type from uploaded files
+        if media_files:
+            first    = media_files[0]
+            is_video = first.content_type.startswith('video')
+            kwargs['post_type'] = 'video' if is_video else 'image'
+
+            # Backward compat: keep single media_file for shorts
+            if len(media_files) == 1:
+                kwargs['media_file'] = first
+
+        post = serializer.save(**kwargs)
+
+        # ✅ Save each file into PostMedia (supports 1–5 files)
+        for i, f in enumerate(media_files):
+            is_video = f.content_type.startswith('video')
+            PostMedia.objects.create(
+                post       = post,
+                file       = f,
+                media_type = 'video' if is_video else 'image',
+                order      = i,
+            )
+
+    # ── Update (PATCH) ────────────────────────────────────────────────
+
+    def perform_update(self, serializer):
+        media_files = self.request.FILES.getlist('media_files')
+        post = serializer.save()
+
+        if media_files:
+            # Clear old media attachments and replace with new uploads
+            PostMedia.objects.filter(post=post).delete()
+
+            for i, f in enumerate(media_files):
+                is_video = f.content_type.startswith('video')
+                PostMedia.objects.create(
+                    post       = post,
+                    file       = f,
+                    media_type = 'video' if is_video else 'image',
+                    order      = i,
+                )
+
+            # Keep backward-compat single field updated too
+            post.media_file = media_files[0]
+            post.post_type  = 'video' if media_files[0].content_type.startswith('video') else 'image'
+            post.save(update_fields=['media_file', 'post_type'])
 
     # ── Delete ────────────────────────────────────────────────────────
 
@@ -179,26 +218,26 @@ class PostViewSet(viewsets.ModelViewSet):
         self.perform_destroy(self.get_object())
         return Response({'message': 'Post deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
 
-    # ── Like (atomic, no race condition) ─────────────────────────────
+    # ── Like ──────────────────────────────────────────────────────────
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def like(self, request, pk=None):
-        post = self.get_object()
+        post    = self.get_object()
         like_qs = PostLike.objects.filter(post=post, user=request.user)
 
         if like_qs.exists():
             like_qs.delete()
-            post.decrement_like()          # atomic F() update
+            post.decrement_like()
             liked = False
         else:
             PostLike.objects.create(post=post, user=request.user)
-            post.increment_like()          # atomic F() update
+            post.increment_like()
             liked = True
 
         post.refresh_from_db(fields=['like_count'])
         return Response({'liked': liked, 'likes_count': post.like_count})
 
-    # ── View count (fire-and-forget, no response body needed) ─────────
+    # ── View count ────────────────────────────────────────────────────
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def view(self, request, pk=None):
@@ -215,7 +254,7 @@ class PostViewSet(viewsets.ModelViewSet):
             serializer = CommentSerializer(data=request.data, context={'request': request})
             if serializer.is_valid():
                 comment = serializer.save(post=post, user=request.user)
-                post.increment_comment()   # atomic
+                post.increment_comment()
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -252,7 +291,7 @@ class PostViewSet(viewsets.ModelViewSet):
 
         if existing:
             existing.delete()
-            original.decrement_comment()   # or keep a repost counter
+            original.decrement_comment()
             new_count = Post.objects.filter(parent_post=original).count()
             return Response({'status': 'unreposted', 'reposts_count': new_count})
 
@@ -294,23 +333,16 @@ class CommentViewSet(viewsets.ModelViewSet):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SHORTS VIEWSET  (TikTok-style vertical video)
+# SHORTS VIEWSET
 # ─────────────────────────────────────────────────────────────────────
 
 class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    Serves natively-uploaded Shorts only.
-    • video_status='ready'  – never shows uploading/processing videos
-    • Ranked by hot_score   – engagement-weighted freshness
-    • League-personalised   – only leagues the user follows
-    • Annotated liked_by_me – zero extra queries
-    """
     serializer_class   = PostSerializer
     permission_classes = [permissions.IsAuthenticated]
     pagination_class   = ShortsCursorPagination
 
     def get_queryset(self):
-        user = self.request.user
+        user    = self.request.user
         like_sq = PostLike.objects.filter(post=OuterRef('pk'), user=user)
 
         qs = (
@@ -325,11 +357,11 @@ class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
                 'hashtags',
                 'author__fan_preferences__league',
                 'author__fan_preferences__team',
+                'media_files',   # ✅ include media_files prefetch for shorts too
             )
             .annotate(liked_by_me=Exists(like_sq))
         )
 
-        # League personalisation
         league_ids = list(user.fan_preferences.values_list('league_id', flat=True))
         if league_ids:
             qs = qs.filter(league_id__in=league_ids)
@@ -357,10 +389,6 @@ class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
 # ─────────────────────────────────────────────────────────────────────
 
 class VideoUploadInitView(APIView):
-    """
-    Step 1 – Client calls this to create a Post shell and get an upload_id.
-    The Post starts with video_status='pending'.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -384,16 +412,12 @@ class VideoUploadInitView(APIView):
 
 
 class VideoChunkUploadView(APIView):
-    """
-    Step 2 – Receives individual file chunks.
-    Each chunk is appended to a temp file server-side.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        upload_id    = request.data.get('upload_id')
-        chunk_index  = int(request.data.get('chunk_index', 0))
-        chunk        = request.FILES.get('chunk')
+        upload_id   = request.data.get('upload_id')
+        chunk_index = int(request.data.get('chunk_index', 0))
+        chunk       = request.FILES.get('chunk')
 
         try:
             session = VideoUploadSession.objects.select_related('post').get(
@@ -402,9 +426,8 @@ class VideoChunkUploadView(APIView):
         except VideoUploadSession.DoesNotExist:
             return Response({'error': 'Invalid session'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Write chunk to a temp file
-        import tempfile, os
-        tmp_dir  = os.path.join(tempfile.gettempdir(), str(upload_id))
+        import tempfile
+        tmp_dir    = os.path.join(tempfile.gettempdir(), str(upload_id))
         os.makedirs(tmp_dir, exist_ok=True)
         chunk_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}')
         with open(chunk_path, 'wb') as f:
@@ -418,16 +441,13 @@ class VideoChunkUploadView(APIView):
 
 
 class VideoUploadFinalizeView(APIView):
-    """
-    Step 3 – Assemble chunks and trigger FFmpeg editing via Celery.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        upload_id   = request.data.get('upload_id')
-        song_id     = request.data.get('song_id')
-        trim_start  = request.data.get('trim_start', 0)
-        trim_end    = request.data.get('trim_end', None)
+        upload_id  = request.data.get('upload_id')
+        song_id    = request.data.get('song_id')
+        trim_start = request.data.get('trim_start', 0)
+        trim_end   = request.data.get('trim_end', None)
 
         try:
             session = VideoUploadSession.objects.select_related('post').get(
@@ -457,9 +477,6 @@ class VideoUploadFinalizeView(APIView):
 # ─────────────────────────────────────────────────────────────────────
 
 class FollowingFeedView(generics.ListAPIView):
-    """
-    Pure 'people I follow' feed – no bot content, no league noise.
-    """
     serializer_class   = PostSerializer
     permission_classes = [IsAuthenticated]
     pagination_class   = FeedCursorPagination
@@ -475,7 +492,7 @@ class FollowingFeedView(generics.ListAPIView):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# LIKE / SHARE  (legacy APIView endpoints kept for backward compat)
+# LIKE / SHARE (legacy APIView endpoints)
 # ─────────────────────────────────────────────────────────────────────
 
 class LikePostView(APIView):
@@ -487,9 +504,7 @@ class LikePostView(APIView):
         )
         if not created:
             like.delete()
-            Post.objects.filter(pk=post_id).update(
-                like_count=F('like_count') - 1
-            )
+            Post.objects.filter(pk=post_id).update(like_count=F('like_count') - 1)
             return Response({'liked': False})
         Post.objects.filter(pk=post_id).update(like_count=F('like_count') + 1)
         return Response({'liked': True})

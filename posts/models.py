@@ -44,7 +44,10 @@ class Post(models.Model):
     )
     content    = models.TextField(blank=True, null=True)
     post_type  = models.CharField(max_length=10, choices=POST_TYPES, default='text')
+
+    # Kept for backward compatibility (single file, e.g. shorts video)
     media_file = models.FileField(upload_to='post_media/', blank=True, null=True)
+
     league = models.ForeignKey(
         League, on_delete=models.CASCADE, related_name='posts', db_index=True
     )
@@ -74,7 +77,6 @@ class Post(models.Model):
     is_repost = models.BooleanField(default=False)
 
     # ── Denormalised counters (updated atomically via F()) ────────────
-    # These power the hot-score algorithm WITHOUT extra DB aggregations.
     view_count    = models.PositiveIntegerField(default=0)
     like_count    = models.PositiveIntegerField(default=0)
     comment_count = models.PositiveIntegerField(default=0)
@@ -87,18 +89,14 @@ class Post(models.Model):
     class Meta:
         ordering = ['-created_at']
         indexes = [
-            # composite index for the home-feed query
             models.Index(fields=['league', '-created_at']),
-            # composite index for profile queries
             models.Index(fields=['author', '-created_at']),
-            # shorts feed
             models.Index(fields=['is_short', 'video_status', '-created_at']),
         ]
 
     def __str__(self):
         return f"{self.author_id} – {self.post_type} – {self.league_id}"
 
-    # ── Cached absolute media URL ─────────────────────────────────────
     def get_media_url(self, request=None):
         if not self.media_file:
             return None
@@ -137,6 +135,36 @@ class Post(models.Model):
 
     def increment_share(self):
         Post.objects.filter(pk=self.pk).update(share_count=models.F('share_count') + 1)
+
+
+# ── NEW: Multi-media support ───────────────────────────────────────────────
+class PostMedia(models.Model):
+    """
+    Stores multiple images/videos for a single Post.
+    A Post can have up to 5 PostMedia entries (enforced in the view).
+    post.media_file is kept for backward compat (shorts single video).
+    """
+    MEDIA_TYPES = (
+        ('image', 'Image'),
+        ('video', 'Video'),
+    )
+
+    post       = models.ForeignKey(
+        Post, on_delete=models.CASCADE, related_name='media_files'
+    )
+    file       = models.FileField(upload_to='post_media/')
+    media_type = models.CharField(max_length=10, choices=MEDIA_TYPES, default='image')
+    order      = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order']
+        indexes  = [
+            models.Index(fields=['post', 'order']),
+        ]
+
+    def __str__(self):
+        return f"PostMedia(post={self.post_id}, type={self.media_type}, order={self.order})"
 
 
 class VideoUploadSession(models.Model):
