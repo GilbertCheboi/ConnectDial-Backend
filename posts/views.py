@@ -3,24 +3,29 @@ views.py – ConnectDial Posts App
 ──────────────────────────────────────────────────────────────────────
 Principles
 ──────────────────────────────────────────────────────────────────────
-• Every queryset goes through get_home_feed_queryset (services.py),
-  which does ONE SQL statement with select_related + prefetch_related
-  and Exists() sub-queries for liked_by_me.
+• Every queryset goes through _base_post_qs which does ONE SQL statement
+  with select_related + prefetch_related and Exists() sub-queries for liked_by_me.
 • Counters are updated atomically via F() expressions; no full-object
   save() is ever called just to bump a number.
 • CursorPagination replaces page-number pagination: no COUNT(*) on
   every request, which is the #1 cause of slow infinite-scroll feeds.
 • All custom actions return only the fields the frontend actually needs.
+
+FIX: perform_create now correctly handles multipart/form-data file uploads.
+     The parser_classes explicitly include MultiPartParser and FormParser so
+     Django always parses request.FILES regardless of Content-Type header casing.
 """
 
 import os
-from django.db.models import Count, Exists, ExpressionWrapper, F, FloatField, OuterRef, Q, Subquery, Value
-from django.db.models.functions import ExtractDay, ExtractHour, Now
+import logging
+
+from django.db.models import Count, Exists, F, OuterRef, Q
 from django.utils import timezone
 
 from rest_framework import filters, generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import CursorPagination
+from rest_framework.parsers import FormParser, MultiPartParser, JSONParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -30,6 +35,8 @@ from users.models import Follow, FanPreference
 from .models import Comment, Hashtag, Post, PostLike, PostMedia, PostShare, VideoUploadSession
 from .serializers import CommentSerializer, HashtagSerializer, PostSerializer
 from .services import get_personalized_shorts, get_trending_hashtags
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -91,7 +98,6 @@ def _base_post_qs(user):
             'hashtags',
             'author__fan_preferences__league',
             'author__fan_preferences__team',
-            # ✅ NEW: prefetch all attached media files (zero extra queries per post)
             'media_files',
         )
         .annotate(
@@ -111,6 +117,9 @@ class PostViewSet(viewsets.ModelViewSet):
     pagination_class   = FeedCursorPagination
     filter_backends    = [filters.SearchFilter]
     search_fields      = ['content', 'author__username', 'league__name']
+
+    # ── CRITICAL: explicitly declare parsers so multipart files always work ──
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     # ── Queryset ──────────────────────────────────────────────────────
 
@@ -157,8 +166,28 @@ class PostViewSet(viewsets.ModelViewSet):
     # ── Create ────────────────────────────────────────────────────────
 
     def perform_create(self, serializer):
-        parent_id   = self.request.data.get('parent_post')
-        media_files = self.request.FILES.getlist('media_files')  # ✅ all uploaded files
+        """
+        FIX: Correctly extract uploaded files from request.FILES.
+        The React Native FormData appends files under the key 'media_files'.
+        request.FILES is a MultiValueDict — getlist() returns all files for that key.
+        """
+        parent_id = self.request.data.get('parent_post')
+
+        # Pull all uploaded files — handles both single and multiple uploads
+        media_files = self.request.FILES.getlist('media_files')
+
+        # Fallback: some RN versions send file under key 'media_file' (singular)
+        if not media_files:
+            single = self.request.FILES.get('media_file')
+            if single:
+                media_files = [single]
+
+        logger.info(
+            "perform_create | user=%s | files_received=%d | keys=%s",
+            self.request.user.id,
+            len(media_files),
+            list(self.request.FILES.keys()),
+        )
 
         kwargs = {'author': self.request.user}
 
@@ -171,13 +200,15 @@ class PostViewSet(viewsets.ModelViewSet):
             is_video = first.content_type.startswith('video')
             kwargs['post_type'] = 'video' if is_video else 'image'
 
-            # Backward compat: keep single media_file for shorts
-            if len(media_files) == 1:
-                kwargs['media_file'] = first
+            # Backward compat: keep single media_file populated (used by shorts)
+            kwargs['media_file'] = first
+        else:
+            # No media — pure text post
+            kwargs.setdefault('post_type', 'text')
 
         post = serializer.save(**kwargs)
 
-        # ✅ Save each file into PostMedia (supports 1–5 files)
+        # Save each uploaded file into PostMedia (supports 1–5 files)
         for i, f in enumerate(media_files):
             is_video = f.content_type.startswith('video')
             PostMedia.objects.create(
@@ -187,10 +218,23 @@ class PostViewSet(viewsets.ModelViewSet):
                 order      = i,
             )
 
+        logger.info(
+            "perform_create | post_id=%s | PostMedia rows created=%d",
+            post.id,
+            len(media_files),
+        )
+
     # ── Update (PATCH) ────────────────────────────────────────────────
 
     def perform_update(self, serializer):
         media_files = self.request.FILES.getlist('media_files')
+
+        # Fallback: singular key
+        if not media_files:
+            single = self.request.FILES.get('media_file')
+            if single:
+                media_files = [single]
+
         post = serializer.save()
 
         if media_files:
@@ -357,7 +401,7 @@ class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
                 'hashtags',
                 'author__fan_preferences__league',
                 'author__fan_preferences__team',
-                'media_files',   # ✅ include media_files prefetch for shorts too
+                'media_files',
             )
             .annotate(liked_by_me=Exists(like_sq))
         )
