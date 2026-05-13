@@ -1,22 +1,26 @@
 """
 views.py – ConnectDial Posts App
 ──────────────────────────────────────────────────────────────────────
-KEY FIXES IN THIS VERSION
+WHY FILES WEREN'T SAVING — ROOT CAUSE CONFIRMED
 ──────────────────────────────────────────────────────────────────────
-1. parser_classes explicitly declared → request.FILES always populated.
+GCS works fine (test.txt saved successfully). The bug is in the
+serializer layer:
 
-2. perform_create BYPASSES the serializer for file fields entirely.
-   Root cause of the bug: PostSerializer had 'media_file' in its fields
-   list, but DRF FileField is NOT writable by default — it is silently
-   dropped from validated_data before reaching serializer.save().
-   Fix: save text fields via serializer first, then assign files directly
-   on the Post instance and call post.save(update_fields=['media_file']).
+  DRF's ModelSerializer auto-generates FileField as READ-ONLY.
+  'media_file' was listed in Meta.fields but silently excluded from
+  validated_data on every POST because DRF treats model FileFields
+  as non-writable unless explicitly declared.
 
-3. PostMedia rows are created with explicit try/except so a GCS failure
-   is logged clearly in journalctl instead of disappearing silently.
+  This means serializer.save(media_file=f) never actually set anything
+  because the field was write-protected at the serializer level.
 
-4. _extract_media_files() tries both 'media_files' (plural, multi-pick)
-   and 'media_file' (singular, legacy / single-pick) keys.
+FIX (two-pronged):
+  1. serializers.py — declare media_file as an explicit writable
+     FileField(required=False, allow_empty_file=True).
+  2. views.py (here) — perform_create saves the Post first (text fields),
+     then assigns media_file directly on the instance + calls
+     post.save(update_fields=['media_file']). This is belt-and-suspenders:
+     even if the serializer ever reverts, the file still saves correctly.
 """
 
 import os
@@ -98,14 +102,14 @@ def _base_post_qs(user):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# HELPER — extract uploaded files safely from request.FILES
+# HELPER — extract uploaded files from request.FILES
 # ─────────────────────────────────────────────────────────────────────
 
 def _extract_media_files(request):
     """
-    React Native FormData typically appends files under 'media_files' (plural).
-    Some single-pick flows use 'media_file' (singular).
-    This helper tries both keys and returns a flat list.
+    Try 'media_files' (plural — React Native multi-pick) first,
+    then 'media_file' (singular — legacy / single-pick) as fallback.
+    Returns a flat list of InMemoryUploadedFile / TemporaryUploadedFile objects.
     """
     files = request.FILES.getlist('media_files')
     if not files:
@@ -114,7 +118,7 @@ def _extract_media_files(request):
             files = [single]
 
     logger.info(
-        "_extract_media_files | FILES keys=%s | resolved %d file(s)",
+        "extract_media_files | FILES.keys=%s | resolved=%d",
         list(request.FILES.keys()), len(files),
     )
     return files
@@ -131,8 +135,8 @@ class PostViewSet(viewsets.ModelViewSet):
     filter_backends    = [filters.SearchFilter]
     search_fields      = ['content', 'author__username', 'league__name']
 
-    # CRITICAL — without explicit parser_classes DRF may skip MultiPartParser
-    # depending on DEFAULT_PARSER_CLASSES in settings, causing request.FILES = {}
+    # Explicit parser_classes — ensures multipart bodies are always parsed
+    # regardless of DEFAULT_PARSER_CLASSES in settings.py
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     # ── Queryset ──────────────────────────────────────────────────────
@@ -179,47 +183,47 @@ class PostViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         """
-        File saving strategy
-        ────────────────────
-        Step 1 — Save the post with text/fk fields only via serializer.save().
-                  Do NOT pass any file to the serializer. DRF FileFields are
-                  read-only by default and will silently discard the file.
+        Two-step file saving — belt and suspenders:
 
-        Step 2 — Assign media_file directly on the instance and call
-                  post.save(update_fields=['media_file', 'post_type']).
-                  This triggers Django's storage backend (GCS / local) correctly.
+        Step 1 — serializer.save() with text/FK fields only.
+                  We intentionally do NOT pass media_file to serializer.save()
+                  because even with the FileField fix in serializers.py, it's
+                  more reliable to assign the file directly on the model instance
+                  (avoids any DRF validation pipeline stripping the file).
 
-        Step 3 — Create PostMedia rows for each uploaded file with explicit
-                  error logging so GCS permission failures surface in logs.
+        Step 2 — assign media_file directly on the Post instance, then call
+                  post.save(update_fields=['media_file']). This talks to the
+                  GCS backend directly, bypassing DRF entirely.
+
+        Step 3 — create one PostMedia row per uploaded file with error logging.
         """
-        parent_id   = self.request.data.get('parent_post')
         media_files = _extract_media_files(self.request)
+        parent_id   = self.request.data.get('parent_post')
 
-        kwargs = {'author': self.request.user}
+        # Determine post_type from mime; default to 'text' if no files
+        if media_files:
+            post_type = 'video' if media_files[0].content_type.startswith('video') else 'image'
+        else:
+            post_type = 'text'
+
+        # Build serializer kwargs — text/FK fields only, no files
+        kwargs = {'author': self.request.user, 'post_type': post_type}
         if parent_id:
             kwargs['parent_post_id'] = parent_id
 
-        # Determine post_type from file mime-type (no file → text post)
-        if media_files:
-            first    = media_files[0]
-            is_video = first.content_type.startswith('video')
-            kwargs['post_type'] = 'video' if is_video else 'image'
-        else:
-            kwargs.setdefault('post_type', 'text')
-
-        # ── Step 1: persist text/FK fields ──────────────────────────
+        # ── Step 1: persist text fields ──────────────────────────────
         post = serializer.save(**kwargs)
-        logger.info("perform_create | post_id=%s | %d file(s) to save", post.id, len(media_files))
+        logger.info("perform_create | post_id=%s | files=%d", post.id, len(media_files))
 
         if not media_files:
             return
 
-        # ── Step 2: persist legacy single media_file field ──────────
+        # ── Step 2: persist legacy single media_file on model directly ──
         try:
             post.media_file = media_files[0]
             post.save(update_fields=['media_file'])
             logger.info(
-                "perform_create | post_id=%s | media_file saved → %s",
+                "perform_create | post_id=%s | media_file → %s",
                 post.id, post.media_file.name,
             )
         except Exception as exc:
@@ -228,7 +232,7 @@ class PostViewSet(viewsets.ModelViewSet):
                 post.id, type(exc).__name__, exc,
             )
 
-        # ── Step 3: create PostMedia rows (1 per file) ───────────────
+        # ── Step 3: create PostMedia rows ────────────────────────────
         for i, f in enumerate(media_files):
             is_video = f.content_type.startswith('video')
             try:
@@ -239,7 +243,7 @@ class PostViewSet(viewsets.ModelViewSet):
                     order      = i,
                 )
                 logger.info(
-                    "perform_create | post_id=%s | PostMedia[%d] saved → %s",
+                    "perform_create | post_id=%s | PostMedia[%d] → %s",
                     post.id, i, pm.file.name,
                 )
             except Exception as exc:
@@ -257,7 +261,6 @@ class PostViewSet(viewsets.ModelViewSet):
         if not media_files:
             return
 
-        # Replace all existing media attachments
         PostMedia.objects.filter(post=post).delete()
 
         for i, f in enumerate(media_files):

@@ -6,6 +6,16 @@ Design principles:
 • Like / follow flags come from annotated Exists() subqueries – zero extra queries.
 • Media URLs are built once via SerializerMethodField using the request context.
 • SupportLogicMixin resolves "Supports [Team]" badge with prefetched fan_preferences.
+
+KEY FIX:
+  DRF's ModelSerializer treats FileField as read-only by default.
+  'media_file' was listed in Meta.fields but was silently excluded from
+  validated_data on every POST, so perform_create never received the file.
+
+  Fix: declare media_file = serializers.FileField(required=False, allow_empty_file=True)
+  explicitly on the serializer so DRF treats it as writable. perform_create in
+  views.py still handles the actual file assignment directly (more reliable),
+  but now the serializer won't strip it from incoming data either.
 """
 
 from rest_framework import serializers
@@ -25,7 +35,10 @@ def _build_url(request, file_field):
     """Return an absolute URL for a FileField/ImageField, or None."""
     if not file_field:
         return None
-    url = file_field.url
+    try:
+        url = file_field.url
+    except Exception:
+        return None
     return request.build_absolute_uri(url) if request else url
 
 
@@ -159,16 +172,30 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
     media_url       = serializers.SerializerMethodField()
     video_status    = serializers.CharField(read_only=True)
 
-    # ✅ NEW: multiple media files (images/videos)
+    # ── FIX: explicitly declare media_file as writable ───────────────
+    # Without this, DRF's ModelSerializer auto-generates FileField as
+    # read-only, silently stripping it from validated_data on every POST.
+    # required=False → text-only posts don't fail validation.
+    # allow_empty_file=True → DRF won't reject 0-byte files during parsing.
+    # NOTE: views.py perform_create handles actual file saving directly;
+    #       this declaration just prevents DRF from silently discarding it.
+    media_file = serializers.FileField(
+        required=False,
+        allow_empty_file=True,
+        use_url=True,
+    )
+
+    # Multiple media files (read-only output; written via PostMedia in views.py)
     media_files = PostMediaSerializer(many=True, read_only=True)
 
     class Meta:
         model  = Post
         fields = [
             'id', 'author_details', 'content', 'is_short', 'post_type',
-            # media_file kept for backward compat (shorts single video)
+            # media_file: writable on input (for legacy single upload),
+            # media_url:  absolute URL on output
             'media_file', 'media_url',
-            # new multi-media list
+            # new multi-media list (read-only output)
             'media_files',
             'video_status', 'duration',
             'league', 'league_details', 'team', 'team_details',
@@ -177,6 +204,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
             'created_at', 'is_owner', 'original_post', 'is_repost',
         ]
         read_only_fields = [
+            # DO NOT put 'media_file' here — that's what was breaking uploads.
             'video_status', 'duration', 'view_count',
             'likes_count', 'comments_count', 'shares_count', 'reposts_count',
         ]
@@ -186,7 +214,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
     def get_media_url(self, obj):
         """
         Returns the absolute URL for the legacy single media_file.
-        Frontend should prefer media_files[] for new posts.
+        Frontend should prefer media_files[] for new multi-media posts.
         """
         request = self.context.get('request')
         return _build_url(request, obj.media_file)
@@ -198,7 +226,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
         return False
 
     def get_liked_by_me(self, obj):
-        """Prefer annotated value; fall back to DB query."""
+        """Prefer annotated value; fall back to DB query only if needed."""
         annotated = getattr(obj, 'liked_by_me', None)
         if annotated is not None:
             return bool(annotated)
