@@ -1,26 +1,28 @@
 """
 views.py – ConnectDial Posts App
 ──────────────────────────────────────────────────────────────────────
-Principles
+KEY FIXES IN THIS VERSION
 ──────────────────────────────────────────────────────────────────────
-• Every queryset goes through _base_post_qs which does ONE SQL statement
-  with select_related + prefetch_related and Exists() sub-queries for liked_by_me.
-• Counters are updated atomically via F() expressions; no full-object
-  save() is ever called just to bump a number.
-• CursorPagination replaces page-number pagination: no COUNT(*) on
-  every request, which is the #1 cause of slow infinite-scroll feeds.
-• All custom actions return only the fields the frontend actually needs.
+1. parser_classes explicitly declared → request.FILES always populated.
 
-FIX: perform_create now correctly handles multipart/form-data file uploads.
-     The parser_classes explicitly include MultiPartParser and FormParser so
-     Django always parses request.FILES regardless of Content-Type header casing.
+2. perform_create BYPASSES the serializer for file fields entirely.
+   Root cause of the bug: PostSerializer had 'media_file' in its fields
+   list, but DRF FileField is NOT writable by default — it is silently
+   dropped from validated_data before reaching serializer.save().
+   Fix: save text fields via serializer first, then assign files directly
+   on the Post instance and call post.save(update_fields=['media_file']).
+
+3. PostMedia rows are created with explicit try/except so a GCS failure
+   is logged clearly in journalctl instead of disappearing silently.
+
+4. _extract_media_files() tries both 'media_files' (plural, multi-pick)
+   and 'media_file' (singular, legacy / single-pick) keys.
 """
 
 import os
 import logging
 
 from django.db.models import Count, Exists, F, OuterRef, Q
-from django.utils import timezone
 
 from rest_framework import filters, generics, permissions, status, viewsets
 from rest_framework.decorators import action
@@ -30,7 +32,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from users.models import Follow, FanPreference
+from users.models import Follow
 
 from .models import Comment, Hashtag, Post, PostLike, PostMedia, PostShare, VideoUploadSession
 from .serializers import CommentSerializer, HashtagSerializer, PostSerializer
@@ -72,27 +74,15 @@ class IsAuthorOrReadOnly(permissions.BasePermission):
 # ─────────────────────────────────────────────────────────────────────
 
 def _base_post_qs(user):
-    """
-    Single, fully-optimised base queryset:
-    • 1 SQL with all JOINs
-    • Exists() sub-query for liked_by_me (no loop)
-    • Uses denormalised counters (no COUNT aggregation)
-    • Prefetches media_files so PostMediaSerializer has zero extra queries
-    """
     like_sq = PostLike.objects.filter(post=OuterRef('pk'), user=user)
-
     return (
         Post.objects
         .select_related(
-            'author',
-            'author__profile',
-            'league',
-            'team',
-            'parent_post',
-            'parent_post__author',
+            'author', 'author__profile',
+            'league', 'team',
+            'parent_post', 'parent_post__author',
             'parent_post__author__profile',
-            'parent_post__league',
-            'parent_post__team',
+            'parent_post__league', 'parent_post__team',
         )
         .prefetch_related(
             'hashtags',
@@ -108,6 +98,29 @@ def _base_post_qs(user):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# HELPER — extract uploaded files safely from request.FILES
+# ─────────────────────────────────────────────────────────────────────
+
+def _extract_media_files(request):
+    """
+    React Native FormData typically appends files under 'media_files' (plural).
+    Some single-pick flows use 'media_file' (singular).
+    This helper tries both keys and returns a flat list.
+    """
+    files = request.FILES.getlist('media_files')
+    if not files:
+        single = request.FILES.get('media_file')
+        if single:
+            files = [single]
+
+    logger.info(
+        "_extract_media_files | FILES keys=%s | resolved %d file(s)",
+        list(request.FILES.keys()), len(files),
+    )
+    return files
+
+
+# ─────────────────────────────────────────────────────────────────────
 # POST VIEWSET
 # ─────────────────────────────────────────────────────────────────────
 
@@ -118,16 +131,17 @@ class PostViewSet(viewsets.ModelViewSet):
     filter_backends    = [filters.SearchFilter]
     search_fields      = ['content', 'author__username', 'league__name']
 
-    # ── CRITICAL: explicitly declare parsers so multipart files always work ──
+    # CRITICAL — without explicit parser_classes DRF may skip MultiPartParser
+    # depending on DEFAULT_PARSER_CLASSES in settings, causing request.FILES = {}
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     # ── Queryset ──────────────────────────────────────────────────────
 
     def get_queryset(self):
-        user = self.request.user
-        qs   = _base_post_qs(user)
+        user   = self.request.user
+        qs     = _base_post_qs(user)
+        params = self.request.query_params
 
-        params       = self.request.query_params
         user_id      = params.get('user')
         filter_type  = params.get('filter')
         league_id    = params.get('league')
@@ -136,9 +150,7 @@ class PostViewSet(viewsets.ModelViewSet):
         feed_type    = params.get('feed_type')
 
         if user.is_authenticated and not league_id and not leagues_list:
-            league_ids = list(
-                user.fan_preferences.values_list('league_id', flat=True)
-            )
+            league_ids = list(user.fan_preferences.values_list('league_id', flat=True))
             if league_ids:
                 qs = qs.filter(league_id__in=league_ids)
 
@@ -167,98 +179,116 @@ class PostViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         """
-        FIX: Correctly extract uploaded files from request.FILES.
-        The React Native FormData appends files under the key 'media_files'.
-        request.FILES is a MultiValueDict — getlist() returns all files for that key.
+        File saving strategy
+        ────────────────────
+        Step 1 — Save the post with text/fk fields only via serializer.save().
+                  Do NOT pass any file to the serializer. DRF FileFields are
+                  read-only by default and will silently discard the file.
+
+        Step 2 — Assign media_file directly on the instance and call
+                  post.save(update_fields=['media_file', 'post_type']).
+                  This triggers Django's storage backend (GCS / local) correctly.
+
+        Step 3 — Create PostMedia rows for each uploaded file with explicit
+                  error logging so GCS permission failures surface in logs.
         """
-        parent_id = self.request.data.get('parent_post')
-
-        # Pull all uploaded files — handles both single and multiple uploads
-        media_files = self.request.FILES.getlist('media_files')
-
-        # Fallback: some RN versions send file under key 'media_file' (singular)
-        if not media_files:
-            single = self.request.FILES.get('media_file')
-            if single:
-                media_files = [single]
-
-        logger.info(
-            "perform_create | user=%s | files_received=%d | keys=%s",
-            self.request.user.id,
-            len(media_files),
-            list(self.request.FILES.keys()),
-        )
+        parent_id   = self.request.data.get('parent_post')
+        media_files = _extract_media_files(self.request)
 
         kwargs = {'author': self.request.user}
-
         if parent_id:
             kwargs['parent_post_id'] = parent_id
 
-        # Determine post_type from uploaded files
+        # Determine post_type from file mime-type (no file → text post)
         if media_files:
             first    = media_files[0]
             is_video = first.content_type.startswith('video')
             kwargs['post_type'] = 'video' if is_video else 'image'
-
-            # Backward compat: keep single media_file populated (used by shorts)
-            kwargs['media_file'] = first
         else:
-            # No media — pure text post
             kwargs.setdefault('post_type', 'text')
 
+        # ── Step 1: persist text/FK fields ──────────────────────────
         post = serializer.save(**kwargs)
+        logger.info("perform_create | post_id=%s | %d file(s) to save", post.id, len(media_files))
 
-        # Save each uploaded file into PostMedia (supports 1–5 files)
-        for i, f in enumerate(media_files):
-            is_video = f.content_type.startswith('video')
-            PostMedia.objects.create(
-                post       = post,
-                file       = f,
-                media_type = 'video' if is_video else 'image',
-                order      = i,
+        if not media_files:
+            return
+
+        # ── Step 2: persist legacy single media_file field ──────────
+        try:
+            post.media_file = media_files[0]
+            post.save(update_fields=['media_file'])
+            logger.info(
+                "perform_create | post_id=%s | media_file saved → %s",
+                post.id, post.media_file.name,
+            )
+        except Exception as exc:
+            logger.error(
+                "perform_create | post_id=%s | media_file FAILED | %s: %s",
+                post.id, type(exc).__name__, exc,
             )
 
-        logger.info(
-            "perform_create | post_id=%s | PostMedia rows created=%d",
-            post.id,
-            len(media_files),
-        )
+        # ── Step 3: create PostMedia rows (1 per file) ───────────────
+        for i, f in enumerate(media_files):
+            is_video = f.content_type.startswith('video')
+            try:
+                pm = PostMedia.objects.create(
+                    post       = post,
+                    file       = f,
+                    media_type = 'video' if is_video else 'image',
+                    order      = i,
+                )
+                logger.info(
+                    "perform_create | post_id=%s | PostMedia[%d] saved → %s",
+                    post.id, i, pm.file.name,
+                )
+            except Exception as exc:
+                logger.error(
+                    "perform_create | post_id=%s | PostMedia[%d] FAILED | %s: %s",
+                    post.id, i, type(exc).__name__, exc,
+                )
 
     # ── Update (PATCH) ────────────────────────────────────────────────
 
     def perform_update(self, serializer):
-        media_files = self.request.FILES.getlist('media_files')
-
-        # Fallback: singular key
-        if not media_files:
-            single = self.request.FILES.get('media_file')
-            if single:
-                media_files = [single]
-
+        media_files = _extract_media_files(self.request)
         post = serializer.save()
 
-        if media_files:
-            # Clear old media attachments and replace with new uploads
-            PostMedia.objects.filter(post=post).delete()
+        if not media_files:
+            return
 
-            for i, f in enumerate(media_files):
-                is_video = f.content_type.startswith('video')
+        # Replace all existing media attachments
+        PostMedia.objects.filter(post=post).delete()
+
+        for i, f in enumerate(media_files):
+            is_video = f.content_type.startswith('video')
+            try:
                 PostMedia.objects.create(
                     post       = post,
                     file       = f,
                     media_type = 'video' if is_video else 'image',
                     order      = i,
                 )
+            except Exception as exc:
+                logger.error(
+                    "perform_update | post_id=%s | PostMedia[%d] FAILED | %s: %s",
+                    post.id, i, type(exc).__name__, exc,
+                )
 
-            # Keep backward-compat single field updated too
+        try:
             post.media_file = media_files[0]
             post.post_type  = 'video' if media_files[0].content_type.startswith('video') else 'image'
             post.save(update_fields=['media_file', 'post_type'])
+        except Exception as exc:
+            logger.error(
+                "perform_update | post_id=%s | media_file update FAILED | %s: %s",
+                post.id, type(exc).__name__, exc,
+            )
 
     # ── Delete ────────────────────────────────────────────────────────
 
     def destroy(self, request, *args, **kwargs):
-        self.get_object()  # triggers permission check
+        self.get_object()
         self.perform_destroy(self.get_object())
         return Response({'message': 'Post deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
 
@@ -297,12 +327,11 @@ class PostViewSet(viewsets.ModelViewSet):
         if request.method == 'POST':
             serializer = CommentSerializer(data=request.data, context={'request': request})
             if serializer.is_valid():
-                comment = serializer.save(post=post, user=request.user)
+                serializer.save(post=post, user=request.user)
                 post.increment_comment()
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # GET – paginated comments
         comments_qs = (
             post.comments
             .select_related('user', 'user__profile')
@@ -313,8 +342,7 @@ class PostViewSet(viewsets.ModelViewSet):
         page = self.paginate_queryset(comments_qs)
         serializer = CommentSerializer(
             page if page is not None else comments_qs,
-            many=True,
-            context={'request': request},
+            many=True, context={'request': request},
         )
         if page is not None:
             return self.get_paginated_response(serializer.data)
@@ -325,31 +353,27 @@ class PostViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def repost(self, request, pk=None):
         original = self.get_object()
-
         existing = Post.objects.filter(
-            author=request.user,
-            parent_post=original,
-            is_repost=True,
-            content='',
+            author=request.user, parent_post=original,
+            is_repost=True, content='',
         ).first()
 
         if existing:
             existing.delete()
             original.decrement_comment()
-            new_count = Post.objects.filter(parent_post=original).count()
-            return Response({'status': 'unreposted', 'reposts_count': new_count})
+            return Response({
+                'status': 'unreposted',
+                'reposts_count': Post.objects.filter(parent_post=original).count(),
+            })
 
         repost = Post.objects.create(
-            author      = request.user,
-            content     = '',
-            parent_post = original,
-            post_type   = 'text',
-            league      = original.league,
-            is_repost   = True,
+            author=request.user, content='',
+            parent_post=original, post_type='text',
+            league=original.league, is_repost=True,
         )
-        new_count = Post.objects.filter(parent_post=original).count()
         return Response(
-            {'status': 'reposted', 'id': repost.id, 'reposts_count': new_count},
+            {'status': 'reposted', 'id': repost.id,
+             'reposts_count': Post.objects.filter(parent_post=original).count()},
             status=status.HTTP_201_CREATED,
         )
 
@@ -393,10 +417,7 @@ class ShortVideoViewSet(viewsets.ReadOnlyModelViewSet):
             Post.objects
             .filter(is_short=True, video_status='ready')
             .exclude(media_file='')
-            .select_related(
-                'author', 'author__profile',
-                'league', 'team',
-            )
+            .select_related('author', 'author__profile', 'league', 'team')
             .prefetch_related(
                 'hashtags',
                 'author__fan_preferences__league',
@@ -423,9 +444,8 @@ class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=['get'])
     def trending(self, request):
-        tags       = get_trending_hashtags(limit=10, days=1)
-        serializer = self.get_serializer(tags, many=True)
-        return Response(serializer.data)
+        tags = get_trending_hashtags(limit=10, days=1)
+        return Response(self.get_serializer(tags, many=True).data)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -436,20 +456,17 @@ class VideoUploadInitView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        league_id    = request.data.get('league_id')
-        total_chunks = int(request.data.get('total_chunks', 1))
-
         post = Post.objects.create(
             author       = request.user,
             post_type    = 'video',
             video_status = 'pending',
-            league_id    = league_id,
+            league_id    = request.data.get('league_id'),
             is_short     = request.data.get('is_short', False),
         )
         session = VideoUploadSession.objects.create(
             user         = request.user,
             post         = post,
-            total_chunks = total_chunks,
+            total_chunks = int(request.data.get('total_chunks', 1)),
         )
         return Response({'upload_id': str(session.id), 'post_id': post.id},
                         status=status.HTTP_201_CREATED)
@@ -474,13 +491,12 @@ class VideoChunkUploadView(APIView):
         tmp_dir    = os.path.join(tempfile.gettempdir(), str(upload_id))
         os.makedirs(tmp_dir, exist_ok=True)
         chunk_path = os.path.join(tmp_dir, f'chunk_{chunk_index:06d}')
-        with open(chunk_path, 'wb') as f:
+        with open(chunk_path, 'wb') as fh:
             for part in chunk.chunks():
-                f.write(part)
+                fh.write(part)
 
         session.uploaded_chunks = chunk_index + 1
         session.save(update_fields=['uploaded_chunks'])
-
         return Response({'received': chunk_index}, status=status.HTTP_200_OK)
 
 
@@ -488,11 +504,7 @@ class VideoUploadFinalizeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        upload_id  = request.data.get('upload_id')
-        song_id    = request.data.get('song_id')
-        trim_start = request.data.get('trim_start', 0)
-        trim_end   = request.data.get('trim_end', None)
-
+        upload_id = request.data.get('upload_id')
         try:
             session = VideoUploadSession.objects.select_related('post').get(
                 id=upload_id, user=request.user
@@ -505,11 +517,10 @@ class VideoUploadFinalizeView(APIView):
         from .tasks import process_video_upload
         process_video_upload.delay(
             post_id    = session.post_id,
-            song_id    = song_id,
-            trim_range = (trim_start, trim_end),
+            song_id    = request.data.get('song_id'),
+            trim_range = (request.data.get('trim_start', 0), request.data.get('trim_end')),
             upload_id  = str(upload_id),
         )
-
         return Response(
             {'status': 'processing', 'message': 'Video is being edited and optimised.'},
             status=status.HTTP_202_ACCEPTED,
@@ -543,9 +554,7 @@ class LikePostView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, post_id):
-        like, created = PostLike.objects.get_or_create(
-            user=request.user, post_id=post_id
-        )
+        like, created = PostLike.objects.get_or_create(user=request.user, post_id=post_id)
         if not created:
             like.delete()
             Post.objects.filter(pk=post_id).update(like_count=F('like_count') - 1)
@@ -558,9 +567,10 @@ class SharePostView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, post_id):
-        comment = request.data.get('comment', '')
         PostShare.objects.create(
-            user=request.user, original_post_id=post_id, comment=comment
+            user=request.user,
+            original_post_id=post_id,
+            comment=request.data.get('comment', ''),
         )
         Post.objects.filter(pk=post_id).update(share_count=F('share_count') + 1)
         return Response({'shared': True})
