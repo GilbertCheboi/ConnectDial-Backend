@@ -27,10 +27,8 @@ ALLOWED_HOSTS = [
     '192.168.100.108',
     '10.199.198.201',
     '10.199.198.22',
-   # plain IP — no scheme
-    'dev.connectdial.com',
-    '51.20.182.163',
-    '*',
+    'api.connectdial.com',
+    '16.16.98.131',          # plain IP — no scheme
 ]
 
 AUTH_USER_MODEL = 'users.User'
@@ -189,17 +187,21 @@ GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 5  # 5 MB
 # CORS
 # ======================
 CORS_ALLOWED_ORIGINS = [
-    'http://51.20.182.163',
-    'https://51.20.182.163',
-    'http://dev.connectdial.com',
-    'https://dev.connectdial.com',
+    'http://16.16.98.131',
+    'https://16.16.98.131',
+    'http://api.connectdial.com',
+    'https://api.connectdial.com',
 ]
+CORS_ALLOW_CREDENTIALS = True
 
+# ======================
+# CSRF
+# ======================
 CSRF_TRUSTED_ORIGINS = [
-    'http://51.20.182.163',
-    'https://51.20.182.163',
-    'http://dev.connectdial.com',
-    'https://dev.connectdial.com',
+    'http://16.16.98.131',
+    'https://16.16.98.131',
+    'http://api.connectdial.com',
+    'https://api.connectdial.com',
 ]
 
 # ======================
@@ -448,3 +450,37 @@ SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 # APP NAME
 # ======================
 APP_NAME = 'ConnectDial'
+
+# ======================
+# CACHES — Redis (Step 6 / required by feed_algorithm.py)
+# ======================
+#
+# feed_algorithm.py uses Django's cache framework to store personalised video
+# rankings. Without this block Django falls back to LocMemCache, which:
+#   • resets on every gunicorn worker restart
+#   • is NOT shared across worker processes (each worker has its own copy)
+#
+# Redis DB 1 is used here so it doesn't collide with Celery (DB 0 above).
+#
+# INSTALL:
+#   pip install django-redis
+#
+# START / VERIFY REDIS (Ubuntu):
+#   sudo service redis-server start
+#   redis-cli ping   # → PONG
+#
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",   # DB 1 — separate from Celery's DB 0
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            # Fail fast if Redis is down rather than hanging every request
+            "SOCKET_CONNECT_TIMEOUT": 5,
+            "SOCKET_TIMEOUT": 5,
+        },
+        # Namespace all keys — easy to identify/flush without
+        # touching Celery's keyspace in DB 0
+        "KEY_PREFIX": "connectdial",
+    }
+}
