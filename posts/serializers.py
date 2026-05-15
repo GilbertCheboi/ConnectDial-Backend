@@ -179,15 +179,16 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
     # allow_empty_file=True → DRF won't reject 0-byte files during parsing.
     # NOTE: views.py perform_create handles actual file saving directly;
     #       this declaration just prevents DRF from silently discarding it.
+     # CRITICAL FIX
     media_file = serializers.FileField(
         required=False,
+        allow_null=True,
         allow_empty_file=True,
-        use_url=True,
     )
 
     # Multiple media files (read-only output; written via PostMedia in views.py)
     media_files = PostMediaSerializer(many=True, read_only=True)
-
+    
     class Meta:
         model  = Post
         fields = [
