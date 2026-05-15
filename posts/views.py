@@ -215,63 +215,65 @@ class PostViewSet(viewsets.ModelViewSet):
         # ─────────────────────────────────────────────────────
         # TEAM FILTER
         # ─────────────────────────────────────────────────────
+
         if team_id:
             qs = qs.filter(team_id=team_id)
 
         # ─────────────────────────────────────────────────────
         # STRICT LEAGUE FEED
+        #
+        # Example:
+        # ?feed_type=league&league_id=1
+        #
+        # RETURNS:
+        # ONLY EPL POSTS
         # ─────────────────────────────────────────────────────
-        if feed_type == 'league':
-            raw_league_id = league_id or params.get('league')
 
-            if raw_league_id in (None, '', 'null', 'undefined', '0'):
-                qs = qs.none()
-                logger.info("LEAGUE FEED | league_id=null → empty")
+        if feed_type == 'league':
+
+            if league_id:
+                qs = qs.filter(league_id=league_id)
+
+                logger.info(
+                    "STRICT LEAGUE FEED | league_id=%s",
+                    league_id,
+                )
+
             else:
-                try:
-                    league_id_int = int(raw_league_id)
-                    qs = qs.filter(league_id=league_id_int)
-                    logger.info("LEAGUE FEED | league_id=%d", league_id_int)
-                except (ValueError, TypeError):
-                    qs = qs.none()
-                    logger.warning("LEAGUE FEED | invalid league_id=%s", raw_league_id)
+                qs = qs.none()
 
             return qs.order_by('-created_at')
 
         # ─────────────────────────────────────────────────────
-        # GLOBAL FEED (Updated as requested)
+        # GLOBAL FEED
+        #
+        # Returns posts from ALL leagues
+        # selected by the user
         # ─────────────────────────────────────────────────────
+
         if feed_type == 'global':
+
             if user.is_authenticated:
+
                 league_ids = list(
-                    user.fan_preferences.values_list('league_id', flat=True)
+                    user.fan_preferences.values_list(
+                        'league_id',
+                        flat=True,
+                    )
                 )
 
                 if league_ids:
-                    qs = qs.filter(league_id__in=league_ids)
+                    qs = qs.filter(
+                        league_id__in=league_ids
+                    )
+
                     logger.info(
                         "GLOBAL FEED | user=%s | leagues=%s",
-                        user.id, league_ids
+                        user.id,
+                        league_ids,
                     )
-                else:
-                    logger.info(
-                        "GLOBAL FEED | user=%s | no fan preferences → showing all",
-                        user.id
-                    )
-                    # No filtering = show posts from all leagues
+
             return qs.order_by('-created_at')
-
-        # ─────────────────────────────────────────────────────
-        # LEGACY leagues param
-        # ─────────────────────────────────────────────────────
-        if leagues_list:
-            try:
-                ids = [int(x) for x in leagues_list.split(',') if x.strip()]
-                qs = qs.filter(league_id__in=ids)
-            except Exception:
-                pass
-
-        return qs.order_by('-created_at')
 
         # ─────────────────────────────────────────────────────
         # LEGACY leagues param
@@ -773,208 +775,4 @@ class FollowingFeedView(generics.ListAPIView):
         )
         
         
-# ─────────────────────────────────────────────────────────────────────
-# LEGACY LIKE API
-# ─────────────────────────────────────────────────────────────────────
-
-class LikePostView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request, post_id):
-
-        like, created = PostLike.objects.get_or_create(
-            user=request.user,
-            post_id=post_id,
-        )
-
-        if not created:
-
-            like.delete()
-
-            Post.objects.filter(pk=post_id).update(
-                like_count=F('like_count') - 1
-            )
-
-            return Response({'liked': False})
-
-        Post.objects.filter(pk=post_id).update(
-            like_count=F('like_count') + 1
-        )
-
-        return Response({'liked': True})
-
-
-# ─────────────────────────────────────────────────────────────────────
-# LEGACY SHARE API
-# ─────────────────────────────────────────────────────────────────────
-
-class SharePostView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request, post_id):
-
-        PostShare.objects.create(
-            user=request.user,
-            original_post_id=post_id,
-            comment=request.data.get('comment', ''),
-        )
-
-        Post.objects.filter(pk=post_id).update(
-            share_count=F('share_count') + 1
-        )
-
-        return Response({'shared': True})
-
-
-# ─────────────────────────────────────────────────────────────────────
-# VIDEO UPLOAD INIT
-# ─────────────────────────────────────────────────────────────────────
-
-class VideoUploadInitView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        post = Post.objects.create(
-            author=request.user,
-            post_type='video',
-            video_status='pending',
-            league_id=request.data.get('league_id'),
-            is_short=request.data.get('is_short', False),
-        )
-
-        session = VideoUploadSession.objects.create(
-            user=request.user,
-            post=post,
-            total_chunks=int(
-                request.data.get('total_chunks', 1)
-            ),
-        )
-
-        return Response(
-            {
-                'upload_id': str(session.id),
-                'post_id': post.id,
-            },
-            status=status.HTTP_201_CREATED,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# VIDEO CHUNK UPLOAD
-# ─────────────────────────────────────────────────────────────────────
-
-class VideoChunkUploadView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        upload_id = request.data.get('upload_id')
-
-        chunk_index = int(
-            request.data.get('chunk_index', 0)
-        )
-
-        chunk = request.FILES.get('chunk')
-
-        try:
-
-            session = (
-                VideoUploadSession.objects
-                .select_related('post')
-                .get(
-                    id=upload_id,
-                    user=request.user,
-                )
-            )
-
-        except VideoUploadSession.DoesNotExist:
-
-            return Response(
-                {'error': 'Invalid session'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        import tempfile
-
-        tmp_dir = os.path.join(
-            tempfile.gettempdir(),
-            str(upload_id),
-        )
-
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        chunk_path = os.path.join(
-            tmp_dir,
-            f'chunk_{chunk_index:06d}',
-        )
-
-        with open(chunk_path, 'wb') as fh:
-
-            for part in chunk.chunks():
-                fh.write(part)
-
-        session.uploaded_chunks = chunk_index + 1
-
-        session.save(update_fields=['uploaded_chunks'])
-
-        return Response(
-            {'received': chunk_index},
-            status=status.HTTP_200_OK,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────
-# VIDEO FINALIZE
-# ─────────────────────────────────────────────────────────────────────
-
-class VideoUploadFinalizeView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-
-        upload_id = request.data.get('upload_id')
-
-        try:
-
-            session = (
-                VideoUploadSession.objects
-                .select_related('post')
-                .get(
-                    id=upload_id,
-                    user=request.user,
-                )
-            )
-
-        except VideoUploadSession.DoesNotExist:
-
-            return Response(
-                {'error': 'Invalid session'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        Post.objects.filter(
-            pk=session.post_id
-        ).update(
-            video_status='processing'
-        )
-
-        from .tasks import process_video_upload
-
-        process_video_upload.delay(
-            post_id=session.post_id,
-            song_id=request.data.get('song_id'),
-            trim_range=(
-                request.data.get('trim_start', 0),
-                request.data.get('trim_end'),
-            ),
-            upload_id=str(upload_id),
-        )
-
-        return Response(
-            {
-                'status': 'processing',
-                'message': 'Video is being edited and optimised.',
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
+        
