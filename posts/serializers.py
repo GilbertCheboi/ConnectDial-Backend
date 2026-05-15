@@ -270,21 +270,36 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
 # COMMENT SERIALIZER
 # ─────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────
+# COMMENT SERIALIZER
+# ─────────────────────────────────────────────────────────────────────
+
 class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
-    author_details  = serializers.SerializerMethodField()
+    author_details = serializers.SerializerMethodField()
     supporting_info = serializers.SerializerMethodField()
-    is_owner        = serializers.SerializerMethodField()
-    liked_by_me     = serializers.SerializerMethodField()
-    likes_count     = serializers.SerializerMethodField()
+    is_owner = serializers.SerializerMethodField()
+    liked_by_me = serializers.SerializerMethodField()
+    likes_count = serializers.SerializerMethodField()
 
     class Meta:
-        model  = Comment
+        model = Comment
         fields = [
-            'id', 'post', 'author_details', 'content',
-            'supporting_info', 'created_at', 'is_owner',
-            'likes_count', 'liked_by_me',
+            'id',
+            'post',                    # Keep for output
+            'author_details',
+            'content',
+            'supporting_info',
+            'created_at',
+            'is_owner',
+            'likes_count',
+            'liked_by_me',
+            'parent_comment',          # Add this if you want replies later
         ]
-        read_only_fields = ['created_at']
+        read_only_fields = [
+            'created_at',
+            'post',                    # ← THIS IS THE KEY FIX
+            'user',
+        ]
 
     def get_author_details(self, obj):
         request = self.context.get('request')
@@ -307,3 +322,6 @@ class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
         if annotated is not None:
             return annotated
         return obj.likes.count()
+
+    def get_supporting_info(self, obj):
+        return super().get_supporting_info(obj)  # from mixin

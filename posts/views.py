@@ -517,30 +517,29 @@ class PostViewSet(viewsets.ModelViewSet):
         post = self.get_object()
 
         if request.method == 'POST':
-
             serializer = CommentSerializer(
                 data=request.data,
                 context={'request': request},
             )
 
             if serializer.is_valid():
-
                 serializer.save(
                     post=post,
                     user=request.user,
                 )
-
                 post.increment_comment()
-
                 return Response(
                     serializer.data,
                     status=status.HTTP_201_CREATED,
                 )
 
-            return Response(
-                serializer.errors,
-                status=status.HTTP_400_BAD_REQUEST,
+            # Improved logging
+            logger.error(
+                "Comment validation failed | post_id=%s | errors=%s | received_data=%s",
+                pk, serializer.errors, request.data
             )
+
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)        
 
         comments_qs = (
             post.comments
