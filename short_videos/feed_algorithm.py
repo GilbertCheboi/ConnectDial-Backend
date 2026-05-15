@@ -166,8 +166,25 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     history_leagues  = _user_history_leagues(user)
     history_teams    = _user_history_teams(user)
 
-    # ── 2. Base queryset ─────────────────────────────────────────────────────
-    qs = ShortVideo.objects.select_related('author', 'league', 'team')
+    # ── 2. Base queryset — STEP 5: add author__profile + prefetch likes ──────
+    #
+    # BEFORE (caused N+1 — one extra query per video for avatar + is_liked):
+    #   qs = ShortVideo.objects.select_related('author', 'league', 'team')
+    #
+    # AFTER: author__profile fetches the avatar in the same JOIN so
+    # ShortVideoSerializer.get_author_avatar() hits no extra DB rows.
+    # prefetch_related('likes') loads all likes in 1 query so
+    # get_is_liked() can use the prefetch cache instead of .exists().
+    #
+    # Net result: 50+ queries per 10-video feed page → 4-5 queries total.
+    qs = ShortVideo.objects.select_related(
+        'author',
+        'author__profile',   # ← fetches avatar in 1 JOIN — no per-video query
+        'league',
+        'team',
+    ).prefetch_related(
+        'likes',             # ← loaded in 1 query — get_is_liked uses cache
+    )
 
     # ── 3. Engagement annotations ────────────────────────────────────────────
     # Use cached_* counters so we avoid expensive COUNT() aggregates per row.
@@ -298,6 +315,9 @@ def _preserve_order_queryset(ids: list):
     """
     Re-fetch videos from cache hit, preserving the previously scored order
     via a CASE WHEN … expression (no re-scoring needed).
+
+    STEP 5: Also add author__profile to select_related and prefetch likes
+    here so the cache-hit path gets the same N+1 fix as the scored path.
     """
     import uuid as _uuid
 
@@ -309,7 +329,15 @@ def _preserve_order_queryset(ids: list):
     return (
         ShortVideo.objects
         .filter(pk__in=uuid_ids)
-        .select_related('author', 'league', 'team')
+        .select_related(
+            'author',
+            'author__profile',   # ← same fix as scored path — avatar in 1 JOIN
+            'league',
+            'team',
+        )
+        .prefetch_related(
+            'likes',             # ← same fix — get_is_liked uses prefetch cache
+        )
         .annotate(
             likes_count    = F('cached_likes'),
             comments_count = F('cached_comments'),
