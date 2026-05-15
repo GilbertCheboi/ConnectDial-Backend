@@ -991,3 +991,39 @@ class TestGoogleTokenView(APIView):
             "error": str(last_error),
             "tried_client_ids": valid_client_ids,
         }, status=status.HTTP_400_BAD_REQUEST)
+# ─────────────────────────────────────────────
+# FOLLOWERS & FOLLOWING LIST VIEWS
+# ─────────────────────────────────────────────
+
+class UserFollowersListView(generics.ListAPIView):
+    """GET /auth/users/<user_id>/followers/"""
+    serializer_class = ProfileSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user_id = self.kwargs.get('user_id')
+        try:
+            user = User.objects.get(id=user_id)
+            return Profile.objects.filter(
+                user__in=user.followers.values_list('follower', flat=True)
+            ).select_related('user')
+        except User.DoesNotExist:
+            return Profile.objects.none()
+
+
+class UserFollowingListView(generics.ListAPIView):
+    """GET /auth/users/<user_id>/following/"""
+    serializer_class = ProfileSerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [TokenAuthentication]
+
+    def get_queryset(self):
+        user_id = self.kwargs.get('user_id')
+        try:
+            user = User.objects.get(id=user_id)
+            return Profile.objects.filter(
+                user__in=user.following.values_list('followed', flat=True)
+            ).select_related('user')
+        except User.DoesNotExist:
+            return Profile.objects.none()

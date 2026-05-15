@@ -32,6 +32,8 @@ from .views import (
 
     # Social
     ToggleFollowView,
+    UserFollowersListView,
+    UserFollowingListView,
 
     # Profile & Onboarding
     OnboardingView,
@@ -75,6 +77,8 @@ urlpatterns = [
 
     # ── Social ────────────────────────────────────────────────
     path('users/<int:user_id>/toggle-follow/', ToggleFollowView.as_view(), name='toggle-follow'),
+    path('users/<int:user_id>/followers/', UserFollowersListView.as_view(), name='user-followers'),
+    path('users/<int:user_id>/following/', UserFollowingListView.as_view(), name='user-following'),
 
     # ── Profile & onboarding ──────────────────────────────────
     path('onboarding/', OnboardingView.as_view(), name='onboarding'),
