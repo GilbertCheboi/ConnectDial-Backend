@@ -219,28 +219,24 @@ class PostViewSet(viewsets.ModelViewSet):
         if team_id:
             qs = qs.filter(team_id=team_id)
 
-        # ─────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────
         # STRICT LEAGUE FEED
-        #
-        # Example:
-        # ?feed_type=league&league_id=1
-        #
-        # RETURNS:
-        # ONLY EPL POSTS
         # ─────────────────────────────────────────────────────
-
         if feed_type == 'league':
+            raw_league_id = league_id or params.get('league')
 
-            if league_id:
-                qs = qs.filter(league_id=league_id)
-
-                logger.info(
-                    "STRICT LEAGUE FEED | league_id=%s",
-                    league_id,
-                )
-
-            else:
+            if raw_league_id in (None, '', 'null', 'undefined', '0'):
+                # Frontend sent null → return empty or fallback
                 qs = qs.none()
+                logger.info("LEAGUE FEED | league_id=null → returning empty")
+            else:
+                try:
+                    league_id_int = int(raw_league_id)
+                    qs = qs.filter(league_id=league_id_int)
+                    logger.info("LEAGUE FEED | league_id=%d", league_id_int)
+                except (ValueError, TypeError):
+                    qs = qs.none()
+                    logger.warning("LEAGUE FEED | invalid league_id=%s", raw_league_id)
 
             return qs.order_by('-created_at')
 
