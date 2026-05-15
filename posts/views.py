@@ -774,4 +774,32 @@ class FollowingFeedView(generics.ListAPIView):
         )
         
         
-        
+class VideoUploadInitView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = VideoUploadSessionSerializer(data=request.data)  # optional
+
+        league_id = request.data.get('league_id')
+
+        post = Post.objects.create(
+            author=request.user,
+            post_type='video',
+            video_status='pending',
+            league_id=league_id,
+            is_short=request.data.get('is_short', False),
+            content=request.data.get('caption', ''),
+        )
+
+        session = VideoUploadSession.objects.create(
+            user=request.user,
+            post=post,
+            total_chunks=int(request.data.get('total_chunks', 1)),
+            file_name=request.data.get('file_name', ''),
+        )
+
+        return Response({
+            'upload_id': str(session.id),
+            'post_id': post.id,
+            'status': 'initialized'
+        }, status=status.HTTP_201_CREATED)        

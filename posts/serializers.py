@@ -21,7 +21,7 @@ KEY FIX:
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 
-from .models import Post, PostMedia, Comment, Hashtag, PostLike, PostShare
+from .models import Post, PostMedia, Comment, Hashtag, PostLike, PostShare, VideoUploadSession
 from users.models import Follow
 
 User = get_user_model()
@@ -325,3 +325,9 @@ class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
 
     def get_supporting_info(self, obj):
         return super().get_supporting_info(obj)  # from mixin
+
+class VideoUploadSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VideoUploadSession
+        fields = ['id', 'post', 'total_chunks', 'uploaded_chunks', 'created_at']
+        read_only_fields = ['id', 'post']
