@@ -56,6 +56,7 @@ from .serializers import (
     CommentSerializer,
     HashtagSerializer,
     PostSerializer,
+    VideoUploadSessionSerializer,
 )
 
 from .services import (
@@ -803,3 +804,174 @@ class VideoUploadInitView(APIView):
             'post_id': post.id,
             'status': 'initialized'
         }, status=status.HTTP_201_CREATED)        
+        
+
+# ─────────────────────────────────────────────────────────────────────
+# LEGACY LIKE API
+# ─────────────────────────────────────────────────────────────────────
+
+class LikePostView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, post_id):
+
+        like, created = PostLike.objects.get_or_create(
+            user=request.user,
+            post_id=post_id,
+        )
+
+        if not created:
+
+            like.delete()
+
+            Post.objects.filter(pk=post_id).update(
+                like_count=F('like_count') - 1
+            )
+
+            return Response({'liked': False})
+
+        Post.objects.filter(pk=post_id).update(
+            like_count=F('like_count') + 1
+        )
+
+        return Response({'liked': True})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LEGACY SHARE API
+# ─────────────────────────────────────────────────────────────────────
+
+class SharePostView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, post_id):
+
+        PostShare.objects.create(
+            user=request.user,
+            original_post_id=post_id,
+            comment=request.data.get('comment', ''),
+        )
+
+        Post.objects.filter(pk=post_id).update(
+            share_count=F('share_count') + 1
+        )
+
+        return Response({'shared': True})
+# ─────────────────────────────────────────────────────────────────────
+# VIDEO CHUNK UPLOAD
+# ─────────────────────────────────────────────────────────────────────
+
+class VideoChunkUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        upload_id = request.data.get('upload_id')
+
+        chunk_index = int(
+            request.data.get('chunk_index', 0)
+        )
+
+        chunk = request.FILES.get('chunk')
+
+        try:
+
+            session = (
+                VideoUploadSession.objects
+                .select_related('post')
+                .get(
+                    id=upload_id,
+                    user=request.user,
+                )
+            )
+
+        except VideoUploadSession.DoesNotExist:
+
+            return Response(
+                {'error': 'Invalid session'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        import tempfile
+
+        tmp_dir = os.path.join(
+            tempfile.gettempdir(),
+            str(upload_id),
+        )
+
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        chunk_path = os.path.join(
+            tmp_dir,
+            f'chunk_{chunk_index:06d}',
+        )
+
+        with open(chunk_path, 'wb') as fh:
+
+            for part in chunk.chunks():
+                fh.write(part)
+
+        session.uploaded_chunks = chunk_index + 1
+
+        session.save(update_fields=['uploaded_chunks'])
+
+        return Response(
+            {'received': chunk_index},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# VIDEO FINALIZE
+# ─────────────────────────────────────────────────────────────────────
+
+class VideoUploadFinalizeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        upload_id = request.data.get('upload_id')
+
+        try:
+
+            session = (
+                VideoUploadSession.objects
+                .select_related('post')
+                .get(
+                    id=upload_id,
+                    user=request.user,
+                )
+            )
+
+        except VideoUploadSession.DoesNotExist:
+
+            return Response(
+                {'error': 'Invalid session'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        Post.objects.filter(
+            pk=session.post_id
+        ).update(
+            video_status='processing'
+        )
+
+        from .tasks import process_video_upload
+
+        process_video_upload.delay(
+            post_id=session.post_id,
+            song_id=request.data.get('song_id'),
+            trim_range=(
+                request.data.get('trim_start', 0),
+                request.data.get('trim_end'),
+            ),
+            upload_id=str(upload_id),
+        )
+
+        return Response(
+            {
+                'status': 'processing',
+                'message': 'Video is being edited and optimised.',
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
