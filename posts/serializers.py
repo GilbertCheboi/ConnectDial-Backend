@@ -20,6 +20,8 @@ KEY FIX:
 
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.types import OpenApiTypes
 
 from .models import Post, PostMedia, Comment, Hashtag, PostLike, PostShare, VideoUploadSession
 from users.models import Follow
@@ -53,6 +55,7 @@ class SupportLogicMixin:
     (done in the view's get_queryset).
     """
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_supporting_info(self, obj):
         user = getattr(obj, 'author', getattr(obj, 'user', None))
         if not user:
@@ -118,6 +121,7 @@ class PostMediaSerializer(serializers.ModelSerializer):
         model  = PostMedia
         fields = ['id', 'file_url', 'media_type', 'order']
 
+    @extend_schema_field(OpenApiTypes.URI)
     def get_file_url(self, obj):
         request = self.context.get('request')
         return _build_url(request, obj.file)
@@ -212,6 +216,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
 
     # ── SerializerMethodFields ────────────────────────────────────────
 
+    @extend_schema_field(OpenApiTypes.URI)
     def get_media_url(self, obj):
         """
         Returns the absolute URL for the legacy single media_file.
@@ -220,12 +225,14 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
         request = self.context.get('request')
         return _build_url(request, obj.media_file)
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_is_owner(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             return request.user.pk == obj.author_id
         return False
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_liked_by_me(self, obj):
         """Prefer annotated value; fall back to DB query only if needed."""
         annotated = getattr(obj, 'liked_by_me', None)
@@ -236,6 +243,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
             return obj.likes.filter(user=request.user).exists()
         return False
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_league_details(self, obj):
         if obj.league_id and obj.league:
             return {
@@ -245,6 +253,7 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
             }
         return None
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_team_details(self, obj):
         if obj.team_id and obj.team:
             return {
@@ -254,12 +263,14 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
             }
         return None
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_original_post(self, obj):
         """Recursive serialisation for reposts/quotes (capped at 1 level)."""
         if obj.parent_post_id and obj.parent_post:
             return PostSerializer(obj.parent_post, context=self.context).data
         return None
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_author_details(self, obj):
         request = self.context.get('request')
         viewer  = request.user if request else None
@@ -275,17 +286,17 @@ class PostSerializer(SupportLogicMixin, serializers.ModelSerializer):
 # ─────────────────────────────────────────────────────────────────────
 
 class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
-    author_details = serializers.SerializerMethodField()
+    author_details  = serializers.SerializerMethodField()
     supporting_info = serializers.SerializerMethodField()
-    is_owner = serializers.SerializerMethodField()
-    liked_by_me = serializers.SerializerMethodField()
-    likes_count = serializers.SerializerMethodField()
+    is_owner        = serializers.SerializerMethodField()
+    liked_by_me     = serializers.SerializerMethodField()
+    likes_count     = serializers.SerializerMethodField()
 
     class Meta:
-        model = Comment
+        model  = Comment
         fields = [
             'id',
-            'post',                    # Keep for output
+            'post',           # read-only output, set in view's perform_create
             'author_details',
             'content',
             'supporting_info',
@@ -293,38 +304,44 @@ class CommentSerializer(SupportLogicMixin, serializers.ModelSerializer):
             'is_owner',
             'likes_count',
             'liked_by_me',
-            'parent_comment',          # Add this if you want replies later
+            # NOTE: 'parent_comment' removed — field does not exist on the
+            # Comment model. Add it here only after adding the FK to the model
+            # and running makemigrations + migrate.
         ]
         read_only_fields = [
             'created_at',
-            'post',                    # ← THIS IS THE KEY FIX
-            'user',
+            'post',   # assigned in view, never writable from request body
         ]
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_author_details(self, obj):
         request = self.context.get('request')
         return _author_dict(obj.user, request)
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_is_owner(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             return request.user.pk == obj.user_id
         return False
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_liked_by_me(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             return obj.likes.filter(user=request.user).exists()
         return False
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_likes_count(self, obj):
         annotated = getattr(obj, 'likes_count', None)
         if annotated is not None:
             return annotated
         return obj.likes.count()
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_supporting_info(self, obj):
-        return super().get_supporting_info(obj)  # from mixin
+        return super().get_supporting_info(obj)
 
 class VideoUploadSessionSerializer(serializers.ModelSerializer):
     class Meta:
