@@ -215,20 +215,18 @@ class PostViewSet(viewsets.ModelViewSet):
         # ─────────────────────────────────────────────────────
         # TEAM FILTER
         # ─────────────────────────────────────────────────────
-
         if team_id:
             qs = qs.filter(team_id=team_id)
 
-  # ─────────────────────────────────────────────────────
+        # ─────────────────────────────────────────────────────
         # STRICT LEAGUE FEED
         # ─────────────────────────────────────────────────────
         if feed_type == 'league':
             raw_league_id = league_id or params.get('league')
 
             if raw_league_id in (None, '', 'null', 'undefined', '0'):
-                # Frontend sent null → return empty or fallback
                 qs = qs.none()
-                logger.info("LEAGUE FEED | league_id=null → returning empty")
+                logger.info("LEAGUE FEED | league_id=null → empty")
             else:
                 try:
                     league_id_int = int(raw_league_id)
@@ -241,35 +239,39 @@ class PostViewSet(viewsets.ModelViewSet):
             return qs.order_by('-created_at')
 
         # ─────────────────────────────────────────────────────
-        # GLOBAL FEED
-        #
-        # Returns posts from ALL leagues
-        # selected by the user
+        # GLOBAL FEED (Updated as requested)
         # ─────────────────────────────────────────────────────
-
         if feed_type == 'global':
-
             if user.is_authenticated:
-
                 league_ids = list(
-                    user.fan_preferences.values_list(
-                        'league_id',
-                        flat=True,
-                    )
+                    user.fan_preferences.values_list('league_id', flat=True)
                 )
 
                 if league_ids:
-                    qs = qs.filter(
-                        league_id__in=league_ids
-                    )
-
+                    qs = qs.filter(league_id__in=league_ids)
                     logger.info(
                         "GLOBAL FEED | user=%s | leagues=%s",
-                        user.id,
-                        league_ids,
+                        user.id, league_ids
                     )
-
+                else:
+                    logger.info(
+                        "GLOBAL FEED | user=%s | no fan preferences → showing all",
+                        user.id
+                    )
+                    # No filtering = show posts from all leagues
             return qs.order_by('-created_at')
+
+        # ─────────────────────────────────────────────────────
+        # LEGACY leagues param
+        # ─────────────────────────────────────────────────────
+        if leagues_list:
+            try:
+                ids = [int(x) for x in leagues_list.split(',') if x.strip()]
+                qs = qs.filter(league_id__in=ids)
+            except Exception:
+                pass
+
+        return qs.order_by('-created_at')
 
         # ─────────────────────────────────────────────────────
         # LEGACY leagues param
