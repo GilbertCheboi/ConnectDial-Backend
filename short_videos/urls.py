@@ -25,4 +25,5 @@ urlpatterns = [
 
     # ── Individual Comment Management ─────────────────────────────────────────
     path('comments/<uuid:pk>/', views.CommentDetailView.as_view(), name='comment-detail'),
+    path('shorts/upload/', views.ShortVideoUploadView.as_view(), name='short-video-upload'),
 ]
