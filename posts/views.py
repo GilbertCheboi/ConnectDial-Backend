@@ -148,36 +148,31 @@ class PostViewSet(viewsets.ModelViewSet):
 
         user_id      = params.get('user')
         filter_type  = params.get('filter')
-        league_id    = params.get('league')
+
+        # FIXED
+        league_id    = params.get('league_id') or params.get('league')
+
         leagues_list = params.get('leagues')
         team_id      = params.get('team')
         feed_type    = params.get('feed_type')
 
+        # STRICT LEAGUE FEED
+        if feed_type == 'league':
+            if league_id:
+                qs = qs.filter(league_id=league_id)
+            else:
+                qs = qs.none()
+
+            return qs.order_by('-created_at')
+
+        # Existing personalized fallback
         if user.is_authenticated and not league_id and not leagues_list:
-            league_ids = list(user.fan_preferences.values_list('league_id', flat=True))
+            league_ids = list(
+                user.fan_preferences.values_list('league_id', flat=True)
+            )
+
             if league_ids:
                 qs = qs.filter(league_id__in=league_ids)
-
-        if league_id:
-            qs = qs.filter(league_id=league_id)
-        elif leagues_list:
-            ids = [x.strip() for x in leagues_list.split(',') if x.strip().isdigit()]
-            if ids:
-                qs = qs.filter(league_id__in=ids)
-
-        if feed_type == 'following' and user.is_authenticated:
-            following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
-            qs = qs.filter(Q(author_id__in=following_ids) | Q(author=user))
-
-        if user_id:
-            qs = qs.filter(author_id=user_id)
-        elif filter_type == 'mine' and user.is_authenticated:
-            qs = qs.filter(author=user)
-
-        if team_id:
-            qs = qs.filter(team_id=team_id)
-
-        return qs.order_by('-created_at')
 
     # ── Create ────────────────────────────────────────────────────────
 
