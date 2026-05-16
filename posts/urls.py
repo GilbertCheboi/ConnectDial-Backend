@@ -1,6 +1,7 @@
 """
 urls.py – ConnectDial Posts App
 """
+
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
@@ -20,30 +21,74 @@ from .views import (
 
 router = DefaultRouter()
 
-# Specific viewsets registered before the catch-all
-router.register(r'shorts',   ShortVideoViewSet, basename='short')
-router.register(r'comments', CommentViewSet,    basename='comment')
-router.register(r'hashtags', HashtagViewSet,    basename='hashtag')
-router.register(r'',         PostViewSet,        basename='post')
+# ─────────────────────────────────────────────────────────────────────
+# VIEWSETS
+# ─────────────────────────────────────────────────────────────────────
+
+router.register(
+    r'shorts',
+    ShortVideoViewSet,
+    basename='short',
+)
+
+router.register(
+    r'comments',
+    CommentViewSet,
+    basename='comment',
+)
+
+router.register(
+    r'hashtags',
+    HashtagViewSet,
+    basename='hashtag',
+)
+
+# Main posts endpoint
+router.register(
+    r'',
+    PostViewSet,
+    basename='post',
+)
+
+# ─────────────────────────────────────────────────────────────────────
+# URLPATTERNS
+# ─────────────────────────────────────────────────────────────────────
 
 urlpatterns = [
-    # ── ViewSet routes ───────────────────────────────────────────────
+
+    # ── DRF ROUTER ENDPOINTS ──────────────────────────────────────
     path('', include(router.urls)),
 
-    # ── Following feed ───────────────────────────────────────────────
-    path('feed/following/', FollowingFeedView.as_view(), name='following-feed'),
+    # ── FOLLOWING FEED ────────────────────────────────────────────
+    path(
+        'feed/following/',
+        FollowingFeedView.as_view(),
+        name='following-feed',
+    ),
 
-    # ── Legacy like / share (kept for backward compatibility) ────────
-    path('<int:post_id>/like/',  LikePostView.as_view(),  name='post-like'),
-    path('<int:post_id>/share/', SharePostView.as_view(), name='post-share'),
+    # ── VIDEO UPLOAD API ──────────────────────────────────────────
+    path(
+        'upload/init/',
+        VideoUploadInitView.as_view(),
+        name='video-upload-init',
+    ),
 
-    # ── Chunked video upload ─────────────────────────────────────────
-    path('upload/init/',     VideoUploadInitView.as_view(),     name='video-upload-init'),
-    path('upload/chunk/',    VideoChunkUploadView.as_view(),    name='video-upload-chunk'),
-    path('upload/finalize/', VideoUploadFinalizeView.as_view(), name='video-upload-finalize'),
+    path(
+        'upload/chunk/',
+        VideoChunkUploadView.as_view(),
+        name='video-upload-chunk',
+    ),
 
-    # ── Deep link share redirect (public, no auth required) ─────────
-    # Opens app if installed, redirects to Play Store if not.
-    # Used as the shareable link: https://api.connectdial.com/share/post/123/
-    path('share/<str:post_type>/<str:post_id>/', ShareRedirectView.as_view(), name='share-redirect'),
+    path(
+        'upload/finalize/',
+        VideoUploadFinalizeView.as_view(),
+        name='video-upload-finalize',
+    ),
+
+    # ── SHARE REDIRECT ────────────────────────────────────────────
+    path(
+        'share/<str:post_type>/<str:post_id>/',
+        ShareRedirectView.as_view(),
+        name='share-redirect',
+    ),
 ]
