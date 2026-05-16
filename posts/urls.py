@@ -12,6 +12,7 @@ from .views import (
     FollowingFeedView,
     LikePostView,
     SharePostView,
+    ShareRedirectView,
     VideoUploadInitView,
     VideoChunkUploadView,
     VideoUploadFinalizeView,
@@ -40,4 +41,9 @@ urlpatterns = [
     path('upload/init/',     VideoUploadInitView.as_view(),     name='video-upload-init'),
     path('upload/chunk/',    VideoChunkUploadView.as_view(),    name='video-upload-chunk'),
     path('upload/finalize/', VideoUploadFinalizeView.as_view(), name='video-upload-finalize'),
+
+    # ── Deep link share redirect (public, no auth required) ─────────
+    # Opens app if installed, redirects to Play Store if not.
+    # Used as the shareable link: https://api.connectdial.com/share/post/123/
+    path('share/<str:post_type>/<str:post_id>/', ShareRedirectView.as_view(), name='share-redirect'),
 ]

@@ -25,12 +25,15 @@ This version preserves:
 ✓ likes
 ✓ personalized global feed
 ✓ strict selected-league filtering
+✓ deep link share redirect (Play Store fallback)
 """
 
 import os
 import logging
 
 from django.db.models import Count, Exists, F, OuterRef, Q
+from django.http import HttpResponse
+from django.views import View
 
 from rest_framework import filters, generics, permissions, status, viewsets
 from rest_framework.decorators import action
@@ -65,6 +68,14 @@ from .services import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────
+# DEEP LINK CONSTANTS
+# ─────────────────────────────────────────────────────────────────────
+
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.connectmobile.app&pcampaignid=web_share"
+APP_SCHEME     = "connectdial"
+APP_DOMAIN     = "https://api.connectdial.com"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -540,7 +551,7 @@ class PostViewSet(viewsets.ModelViewSet):
                 pk, serializer.errors, request.data
             )
 
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)        
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         comments_qs = (
             post.comments
@@ -773,8 +784,8 @@ class FollowingFeedView(generics.ListAPIView):
             )
             .order_by('-created_at')
         )
-        
-        
+
+
 class VideoUploadInitView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -803,8 +814,8 @@ class VideoUploadInitView(APIView):
             'upload_id': str(session.id),
             'post_id': post.id,
             'status': 'initialized'
-        }, status=status.HTTP_201_CREATED)        
-        
+        }, status=status.HTTP_201_CREATED)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # LEGACY LIKE API
@@ -857,6 +868,175 @@ class SharePostView(APIView):
         )
 
         return Response({'shared': True})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DEEP LINK SHARE REDIRECT
+# ─────────────────────────────────────────────────────────────────────
+# Handles public share links opened in a browser.
+#
+# Flow:
+#   1. User shares: https://api.connectdial.com/share/post/123/
+#   2. Browser opens that URL
+#   3. Page immediately tries connectdial://share/post/123
+#   4. If app installed → app opens to that post
+#   5. If app NOT installed → after 2.5s → Play Store
+#
+# No authentication required — this is a public redirect page.
+# ─────────────────────────────────────────────────────────────────────
+
+class ShareRedirectView(View):
+    """
+    Public view — no DRF auth, plain Django View.
+    Accessible at: /share/<post_type>/<post_id>/
+
+    Valid post_type values: post, profile, event
+    """
+
+    VALID_TYPES = {"post", "profile", "event"}
+
+    def get(self, request, post_type: str, post_id: str):
+
+        if post_type not in self.VALID_TYPES:
+            return HttpResponse("Invalid share type.", status=400)
+
+        deep_link  = f"{APP_SCHEME}://share/{post_type}/{post_id}"
+        canonical  = f"{APP_DOMAIN}/share/{post_type}/{post_id}/"
+        type_label = post_type.capitalize()   # Post / Profile / Event
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Opening ConnectDial\u2026</title>
+
+  <!-- Open Graph — controls WhatsApp / Twitter link preview card -->
+  <meta property="og:title"       content="Check this {type_label} on ConnectDial" />
+  <meta property="og:description" content="Open ConnectDial to view this {type_label}." />
+  <meta property="og:image"       content="{APP_DOMAIN}/static/og-image.png" />
+  <meta property="og:url"         content="{canonical}" />
+  <meta property="og:type"        content="website" />
+
+  <!-- Twitter card -->
+  <meta name="twitter:card"        content="summary_large_image" />
+  <meta name="twitter:title"       content="Check this {type_label} on ConnectDial" />
+  <meta name="twitter:description" content="Open ConnectDial to view this {type_label}." />
+  <meta name="twitter:image"       content="{APP_DOMAIN}/static/og-image.png" />
+
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f0f;
+      color: #ffffff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+      text-align: center;
+    }}
+    .logo {{
+      width: 80px;
+      height: 80px;
+      border-radius: 20px;
+      background: #1a73e8;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+      margin-bottom: 24px;
+    }}
+    h1 {{ font-size: 22px; margin-bottom: 8px; }}
+    p  {{ font-size: 14px; color: #aaaaaa; margin-bottom: 32px; }}
+    .btn {{
+      display: inline-block;
+      padding: 14px 32px;
+      border-radius: 50px;
+      font-size: 16px;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      border: none;
+    }}
+    .btn-primary {{
+      background: #1a73e8;
+      color: #ffffff;
+      margin-bottom: 12px;
+      width: 100%;
+      max-width: 320px;
+    }}
+    .btn-secondary {{
+      background: transparent;
+      color: #aaaaaa;
+      border: 1px solid #333;
+      width: 100%;
+      max-width: 320px;
+      font-size: 14px;
+    }}
+    .spinner {{
+      width: 20px; height: 20px;
+      border: 2px solid #ffffff44;
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: inline-block;
+      margin-right: 8px;
+      vertical-align: middle;
+    }}
+    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  </style>
+</head>
+<body>
+
+  <div class="logo">\U0001f4f1</div>
+  <h1>Opening ConnectDial\u2026</h1>
+  <p>If the app doesn\u2019t open automatically,<br/>download it from the Play Store.</p>
+
+  <a id="open-btn" href="{deep_link}" class="btn btn-primary">
+    <span class="spinner"></span> Open in ConnectDial
+  </a>
+
+  <br/><br/>
+
+  <a href="{PLAY_STORE_URL}" class="btn btn-secondary">
+    Download ConnectDial
+  </a>
+
+  <script>
+    // Immediately try to open the app via custom URI scheme
+    window.location.href = "{deep_link}";
+
+    // After 2.5s, if the app didn't open (not installed),
+    // redirect to Play Store
+    var fallbackTimer = setTimeout(function () {{
+      window.location.href = "{PLAY_STORE_URL}";
+    }}, 2500);
+
+    // Manual tap on the button: reset the timer
+    document.getElementById("open-btn").addEventListener("click", function () {{
+      clearTimeout(fallbackTimer);
+      setTimeout(function () {{
+        window.location.href = "{PLAY_STORE_URL}";
+      }}, 2500);
+    }});
+
+    // Page goes hidden = app opened successfully, cancel Play Store redirect
+    document.addEventListener("visibilitychange", function () {{
+      if (document.hidden) {{
+        clearTimeout(fallbackTimer);
+      }}
+    }});
+  </script>
+
+</body>
+</html>"""
+
+        return HttpResponse(html, content_type="text/html; charset=utf-8")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # VIDEO CHUNK UPLOAD
 # ─────────────────────────────────────────────────────────────────────
