@@ -869,28 +869,41 @@ class SharePostView(APIView):
 
         return Response({'shared': True})
 
-
 # ─────────────────────────────────────────────────────────────────────
 # DEEP LINK SHARE REDIRECT
 # ─────────────────────────────────────────────────────────────────────
 # Handles public share links opened in a browser.
 #
-# Flow:
-#   1. User shares: https://api.connectdial.com/share/post/123/
-#   2. Browser opens that URL
-#   3. Page immediately tries connectdial://share/post/123
-#   4. If app installed → app opens to that post
-#   5. If app NOT installed → after 2.5s → Play Store
+# FLOW:
+#   1. User opens:
+#        https://api.connectdial.com/api/posts/share/post/123/
 #
-# No authentication required — this is a public redirect page.
+#   2. Browser instantly attempts:
+#        connectdial://comments/123
+#
+#   3. If app installed:
+#        → opens comments screen directly
+#
+#   4. If app NOT installed:
+#        → automatically redirects to Play Store
+#
+# This gives:
+#   ✅ Direct in-app comments opening
+#   ✅ Automatic Play Store fallback
+#   ✅ WhatsApp/Twitter preview support
+#   ✅ No website landing page
 # ─────────────────────────────────────────────────────────────────────
 
 class ShareRedirectView(View):
     """
     Public view — no DRF auth, plain Django View.
-    Accessible at: /share/<post_type>/<post_id>/
+    Accessible at:
+        /api/posts/share/<post_type>/<post_id>/
 
-    Valid post_type values: post, profile, event
+    Valid post_type values:
+        post
+        profile
+        event
     """
 
     VALID_TYPES = {"post", "profile", "event"}
@@ -900,142 +913,271 @@ class ShareRedirectView(View):
         if post_type not in self.VALID_TYPES:
             return HttpResponse("Invalid share type.", status=400)
 
-        deep_link  = f"{APP_SCHEME}://share/{post_type}/{post_id}"
-        canonical  = f"{APP_DOMAIN}/share/{post_type}/{post_id}/"
-        type_label = post_type.capitalize()   # Post / Profile / Event
+        # ─────────────────────────────────────────────────────────────
+        # DIRECT COMMENTS DEEP LINK
+        # ─────────────────────────────────────────────────────────────
+        # Opens:
+        #   connectdial://comments/123
+        #
+        # Your React Navigation should handle:
+        #   comments/:postId
+        # ─────────────────────────────────────────────────────────────
+        deep_link = f"{APP_SCHEME}://comments/{post_id}"
+
+        canonical = f"{APP_DOMAIN}/api/posts/share/{post_type}/{post_id}/"
+
+        type_label = post_type.capitalize()
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Opening ConnectDial\u2026</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
 
-  <!-- Open Graph — controls WhatsApp / Twitter link preview card -->
-  <meta property="og:title"       content="Check this {type_label} on ConnectDial" />
-  <meta property="og:description" content="Open ConnectDial to view this {type_label}." />
-  <meta property="og:image"       content="{APP_DOMAIN}/static/og-image.png" />
-  <meta property="og:url"         content="{canonical}" />
-  <meta property="og:type"        content="website" />
+  <title>Opening ConnectDial…</title>
 
-  <!-- Twitter card -->
-  <meta name="twitter:card"        content="summary_large_image" />
-  <meta name="twitter:title"       content="Check this {type_label} on ConnectDial" />
-  <meta name="twitter:description" content="Open ConnectDial to view this {type_label}." />
-  <meta name="twitter:image"       content="{APP_DOMAIN}/static/og-image.png" />
+  <!-- Open Graph -->
+  <meta
+    property="og:title"
+    content="Open this {type_label} on ConnectDial"
+  />
+
+  <meta
+    property="og:description"
+    content="View comments directly in the ConnectDial app."
+  />
+
+  <meta
+    property="og:image"
+    content="{APP_DOMAIN}/static/og-image.png"
+  />
+
+  <meta
+    property="og:url"
+    content="{canonical}"
+  />
+
+  <meta
+    property="og:type"
+    content="website"
+  />
+
+  <!-- Twitter -->
+  <meta
+    name="twitter:card"
+    content="summary_large_image"
+  />
+
+  <meta
+    name="twitter:title"
+    content="Open this {type_label} on ConnectDial"
+  />
+
+  <meta
+    name="twitter:description"
+    content="View comments directly in the ConnectDial app."
+  />
+
+  <meta
+    name="twitter:image"
+    content="{APP_DOMAIN}/static/og-image.png"
+  />
 
   <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    * {{
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }}
+
     body {{
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #0f0f0f;
-      color: #ffffff;
+      background: #0f172a;
+      color: white;
+      font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Roboto,
+        sans-serif;
+
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
+
       min-height: 100vh;
       padding: 24px;
       text-align: center;
     }}
+
     .logo {{
-      width: 80px;
-      height: 80px;
-      border-radius: 20px;
-      background: #1a73e8;
+      width: 84px;
+      height: 84px;
+      border-radius: 24px;
+
+      background: #1d4ed8;
+
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 36px;
+
+      font-size: 42px;
+
       margin-bottom: 24px;
     }}
-    h1 {{ font-size: 22px; margin-bottom: 8px; }}
-    p  {{ font-size: 14px; color: #aaaaaa; margin-bottom: 32px; }}
+
+    h1 {{
+      font-size: 24px;
+      margin-bottom: 10px;
+    }}
+
+    p {{
+      color: #94a3b8;
+      font-size: 15px;
+      line-height: 22px;
+      max-width: 320px;
+      margin-bottom: 30px;
+    }}
+
     .btn {{
-      display: inline-block;
-      padding: 14px 32px;
-      border-radius: 50px;
-      font-size: 16px;
-      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+
+      width: 100%;
+      max-width: 320px;
+
+      padding: 15px 22px;
+
+      border-radius: 999px;
+
       text-decoration: none;
-      cursor: pointer;
-      border: none;
+
+      font-weight: 700;
+      font-size: 16px;
+
+      transition: opacity 0.2s ease;
     }}
-    .btn-primary {{
-      background: #1a73e8;
-      color: #ffffff;
-      margin-bottom: 12px;
-      width: 100%;
-      max-width: 320px;
+
+    .btn:active {{
+      opacity: 0.85;
     }}
-    .btn-secondary {{
+
+    .primary {{
+      background: #2563eb;
+      color: white;
+      margin-bottom: 14px;
+    }}
+
+    .secondary {{
+      border: 1px solid #334155;
+      color: #cbd5e1;
       background: transparent;
-      color: #aaaaaa;
-      border: 1px solid #333;
-      width: 100%;
-      max-width: 320px;
       font-size: 14px;
     }}
+
     .spinner {{
-      width: 20px; height: 20px;
-      border: 2px solid #ffffff44;
-      border-top-color: #ffffff;
+      width: 18px;
+      height: 18px;
+
       border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      display: inline-block;
-      margin-right: 8px;
-      vertical-align: middle;
+      border: 2px solid rgba(255,255,255,0.35);
+      border-top-color: white;
+
+      margin-right: 10px;
+
+      animation: spin 0.7s linear infinite;
     }}
-    @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+    @keyframes spin {{
+      to {{
+        transform: rotate(360deg);
+      }}
+    }}
   </style>
 </head>
+
 <body>
 
-  <div class="logo">\U0001f4f1</div>
-  <h1>Opening ConnectDial\u2026</h1>
-  <p>If the app doesn\u2019t open automatically,<br/>download it from the Play Store.</p>
+  <div class="logo">💬</div>
 
-  <a id="open-btn" href="{deep_link}" class="btn btn-primary">
-    <span class="spinner"></span> Open in ConnectDial
+  <h1>Opening Comments…</h1>
+
+  <p>
+    If ConnectDial is installed,
+    comments will open automatically.
+  </p>
+
+  <a
+    id="open-btn"
+    href="{deep_link}"
+    class="btn primary"
+  >
+    <span class="spinner"></span>
+    Open in ConnectDial
   </a>
 
-  <br/><br/>
-
-  <a href="{PLAY_STORE_URL}" class="btn btn-secondary">
+  <a
+    href="{PLAY_STORE_URL}"
+    class="btn secondary"
+  >
     Download ConnectDial
   </a>
 
   <script>
-    // Immediately try to open the app via custom URI scheme
+
+    // ───────────────────────────────────────────────────────────
+    // Try opening app instantly
+    // ───────────────────────────────────────────────────────────
     window.location.href = "{deep_link}";
 
-    // After 2.5s, if the app didn't open (not installed),
+    // ───────────────────────────────────────────────────────────
+    // If app isn't installed:
     // redirect to Play Store
-    var fallbackTimer = setTimeout(function () {{
+    // ───────────────────────────────────────────────────────────
+    const fallbackTimer = setTimeout(function () {{
       window.location.href = "{PLAY_STORE_URL}";
-    }}, 2500);
+    }}, 1800);
 
-    // Manual tap on the button: reset the timer
-    document.getElementById("open-btn").addEventListener("click", function () {{
-      clearTimeout(fallbackTimer);
-      setTimeout(function () {{
-        window.location.href = "{PLAY_STORE_URL}";
-      }}, 2500);
-    }});
-
-    // Page goes hidden = app opened successfully, cancel Play Store redirect
+    // ───────────────────────────────────────────────────────────
+    // If app opened successfully:
+    // browser becomes hidden
+    // cancel Play Store redirect
+    // ───────────────────────────────────────────────────────────
     document.addEventListener("visibilitychange", function () {{
       if (document.hidden) {{
         clearTimeout(fallbackTimer);
       }}
     }});
+
+    // ───────────────────────────────────────────────────────────
+    // Manual open button
+    // ───────────────────────────────────────────────────────────
+    document
+      .getElementById("open-btn")
+      .addEventListener("click", function () {{
+
+        clearTimeout(fallbackTimer);
+
+        setTimeout(function () {{
+          window.location.href = "{PLAY_STORE_URL}";
+        }}, 1800);
+
+      }});
+
   </script>
 
 </body>
-</html>"""
+</html>
+"""
 
-        return HttpResponse(html, content_type="text/html; charset=utf-8")
-
+        return HttpResponse(
+            html,
+            content_type="text/html; charset=utf-8",
+        )
 
 # ─────────────────────────────────────────────────────────────────────
 # VIDEO CHUNK UPLOAD
