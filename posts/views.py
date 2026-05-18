@@ -168,14 +168,8 @@ def _extract_media_files(request):
 # ─────────────────────────────────────────────────────────────────────
 # POST VIEWSET
 # ─────────────────────────────────────────────────────────────────────
-
 class PostViewSet(viewsets.ModelViewSet):
     serializer_class = PostSerializer
-
-    permission_classes = [
-        permissions.IsAuthenticated,
-        IsAuthorOrReadOnly,
-    ]
 
     pagination_class = FeedCursorPagination
 
@@ -194,135 +188,92 @@ class PostViewSet(viewsets.ModelViewSet):
     ]
 
     # ─────────────────────────────────────────────────────────────
-    # QUERYSET
+    # PERMISSIONS - Fixed for Public Global Feed
     # ─────────────────────────────────────────────────────────────
+    def get_permissions(self):
+        """Global feed and post detail are public. Other actions require auth."""
+        if self.action in ['list', 'retrieve']:
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated(), IsAuthorOrReadOnly()]
 
+    # ─────────────────────────────────────────────────────────────
+    # QUERYSET - Fixed & Safe
+    # ─────────────────────────────────────────────────────────────
     def get_queryset(self):
         user = self.request.user
-
-        qs = _base_post_qs(user)
-
         params = self.request.query_params
+        feed_type = params.get('feed_type', 'global')
+
+        # Safe base queryset
+        qs = _base_post_qs(user if user.is_authenticated else None)
 
         user_id = params.get('user')
-        filter_type = params.get('filter')
-
-        # IMPORTANT FIX
-        league_id = (
-            params.get('league_id')
-            or params.get('league')
-        )
-
+        league_id = params.get('league_id') or params.get('league')
         leagues_list = params.get('leagues')
         team_id = params.get('team')
-        feed_type = params.get('feed_type')
 
-        # ─────────────────────────────────────────────────────
-        # USER POSTS
-        # ─────────────────────────────────────────────────────
-
+        # USER PROFILE POSTS
         if user_id:
-            qs = qs.filter(author_id=user_id)
+            return qs.filter(author_id=user_id).order_by('-created_at')
 
-        # ─────────────────────────────────────────────────────
         # TEAM FILTER
-        # ─────────────────────────────────────────────────────
-
         if team_id:
             qs = qs.filter(team_id=team_id)
 
-        # ─────────────────────────────────────────────────────
         # STRICT LEAGUE FEED
-        #
-        # Example:
-        # ?feed_type=league&league_id=1
-        #
-        # RETURNS:
-        # ONLY EPL POSTS
-        # ─────────────────────────────────────────────────────
-
         if feed_type == 'league':
-
             if league_id:
                 qs = qs.filter(league_id=league_id)
-
-                logger.info(
-                    "STRICT LEAGUE FEED | league_id=%s",
-                    league_id,
-                )
-
             else:
                 qs = qs.none()
-
             return qs.order_by('-created_at')
 
-        # ─────────────────────────────────────────────────────
-        # GLOBAL FEED
-        #
-        # Returns posts from ALL leagues
-        # selected by the user
-        # ─────────────────────────────────────────────────────
-
+        # GLOBAL FEED - Fixed for anonymous users
         if feed_type == 'global':
-
             if user.is_authenticated:
-
                 league_ids = list(
-                    user.fan_preferences.values_list(
-                        'league_id',
-                        flat=True,
-                    )
+                    user.fan_preferences.values_list('league_id', flat=True)
                 )
-
                 if league_ids:
-                    qs = qs.filter(
-                        league_id__in=league_ids
-                    )
-
-                    logger.info(
-                        "GLOBAL FEED | user=%s | leagues=%s",
-                        user.id,
-                        league_ids,
-                    )
-
+                    qs = qs.filter(league_id__in=league_ids)
+                    logger.info("GLOBAL FEED | user=%s | leagues=%s", user.id, league_ids)
+            else:
+                # Anonymous users see recent posts from any league
+                qs = qs.filter(league__isnull=False)
             return qs.order_by('-created_at')
 
-        # ─────────────────────────────────────────────────────
-        # LEGACY leagues param
-        # Example:
-        # ?leagues=1,2,3
-        # ─────────────────────────────────────────────────────
+        # FOLLOWING FEED (redirect to separate view or handle here)
+        if feed_type == 'following':
+            if user.is_authenticated:
+                following_ids = Follow.objects.filter(
+                    follower=user
+                ).values_list('followed_id', flat=True)
+                return qs.filter(
+                    Q(author_id__in=following_ids) | Q(author=user)
+                ).order_by('-created_at')
+            else:
+                return qs.none()
 
+        # LEGACY leagues param
         if leagues_list:
             try:
-                ids = [
-                    int(x)
-                    for x in leagues_list.split(',')
-                    if x.strip()
-                ]
-
+                ids = [int(x) for x in leagues_list.split(',') if x.strip()]
                 qs = qs.filter(league_id__in=ids)
-
             except Exception:
                 pass
 
         return qs.order_by('-created_at')
 
     # ─────────────────────────────────────────────────────────────
-    # CREATE
+    # CREATE, UPDATE, DELETE (Kept from your original)
     # ─────────────────────────────────────────────────────────────
-
     def perform_create(self, serializer):
         media_files = _extract_media_files(self.request)
 
         parent_id = self.request.data.get('parent_post')
 
         if media_files:
-            post_type = (
-                'video'
-                if media_files[0].content_type.startswith('video')
-                else 'image'
-            )
+            post_type = 'video' if media_files[0].content_type.startswith('video') else 'image'
         else:
             post_type = 'text'
 
@@ -336,38 +287,21 @@ class PostViewSet(viewsets.ModelViewSet):
 
         post = serializer.save(**kwargs)
 
-        logger.info(
-            "perform_create | post_id=%s | files=%d",
-            post.id,
-            len(media_files),
-        )
+        logger.info("perform_create | post_id=%s | files=%d", post.id, len(media_files))
 
         if not media_files:
             return
 
-        # Save legacy media_file
+        # Legacy media_file
         try:
             post.media_file = media_files[0]
-
             post.save(update_fields=['media_file'])
-
-            logger.info(
-                "perform_create | media saved | post=%s",
-                post.id,
-            )
-
         except Exception as exc:
-            logger.error(
-                "media_file save FAILED | %s: %s",
-                type(exc).__name__,
-                exc,
-            )
+            logger.error("media_file save FAILED | %s: %s", type(exc).__name__, exc)
 
-        # Create PostMedia rows
+        # PostMedia entries
         for i, f in enumerate(media_files):
-
             is_video = f.content_type.startswith('video')
-
             try:
                 PostMedia.objects.create(
                     post=post,
@@ -375,21 +309,12 @@ class PostViewSet(viewsets.ModelViewSet):
                     media_type='video' if is_video else 'image',
                     order=i,
                 )
-
             except Exception as exc:
-                logger.error(
-                    "PostMedia FAILED | %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-
-    # ─────────────────────────────────────────────────────────────
-    # UPDATE
-    # ─────────────────────────────────────────────────────────────
+                logger.error("PostMedia FAILED | %s: %s", type(exc).__name__, exc)
 
     def perform_update(self, serializer):
+        # ... (your original code - unchanged)
         media_files = _extract_media_files(self.request)
-
         post = serializer.save()
 
         if not media_files:
@@ -398,9 +323,7 @@ class PostViewSet(viewsets.ModelViewSet):
         PostMedia.objects.filter(post=post).delete()
 
         for i, f in enumerate(media_files):
-
             is_video = f.content_type.startswith('video')
-
             try:
                 PostMedia.objects.create(
                     post=post,
@@ -408,51 +331,20 @@ class PostViewSet(viewsets.ModelViewSet):
                     media_type='video' if is_video else 'image',
                     order=i,
                 )
-
             except Exception as exc:
-                logger.error(
-                    "perform_update FAILED | %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
+                logger.error("perform_update FAILED | %s: %s", type(exc).__name__, exc)
 
         try:
             post.media_file = media_files[0]
-
-            post.post_type = (
-                'video'
-                if media_files[0].content_type.startswith('video')
-                else 'image'
-            )
-
-            post.save(
-                update_fields=[
-                    'media_file',
-                    'post_type',
-                ]
-            )
-
+            post.post_type = 'video' if media_files[0].content_type.startswith('video') else 'image'
+            post.save(update_fields=['media_file', 'post_type'])
         except Exception as exc:
-            logger.error(
-                "media update FAILED | %s: %s",
-                type(exc).__name__,
-                exc,
-            )
-
-    # ─────────────────────────────────────────────────────────────
-    # DELETE
-    # ─────────────────────────────────────────────────────────────
+            logger.error("media update FAILED | %s: %s", type(exc).__name__, exc)
 
     def destroy(self, request, *args, **kwargs):
         post = self.get_object()
-
         self.perform_destroy(post)
-
-        return Response(
-            {'message': 'Post deleted successfully'},
-            status=status.HTTP_204_NO_CONTENT,
-        )
-
+        return Response({'message': 'Post deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
     # ─────────────────────────────────────────────────────────────
     # LIKE
     # ─────────────────────────────────────────────────────────────
@@ -760,31 +652,18 @@ class HashtagViewSet(viewsets.ReadOnlyModelViewSet):
 
 class FollowingFeedView(generics.ListAPIView):
     serializer_class = PostSerializer
-
     permission_classes = [IsAuthenticated]
-
     pagination_class = FeedCursorPagination
 
     def get_queryset(self):
-
         user = self.request.user
-
         following_ids = Follow.objects.filter(
             follower=user
-        ).values_list(
-            'followed_id',
-            flat=True,
-        )
+        ).values_list('followed_id', flat=True)
 
-        return (
-            _base_post_qs(user)
-            .filter(
-                Q(author_id__in=following_ids)
-                | Q(author=user)
-            )
-            .order_by('-created_at')
-        )
-
+        return _base_post_qs(user).filter(
+            Q(author_id__in=following_ids) | Q(author=user)
+        ).order_by('-created_at')
 
 class VideoUploadInitView(APIView):
     permission_classes = [IsAuthenticated]
