@@ -434,25 +434,26 @@ class VerifyOTPView(APIView):
 # FORGOT PASSWORD
 # ─────────────────────────────────────────────
 
+# Optimal Backend Update in views.py
 class ForgotPasswordView(APIView):
-    """POST /auth/password/forgot/ — Body: { "email": "..." }"""
     permission_classes = [AllowAny]
     throttle_classes   = [PasswordResetThrottle]
 
     def post(self, request):
-        email = request.data.get("email", "").strip().lower()
+        # Change 'email' to a generic identifier lookup
+        identifier = request.data.get("email", "").strip() 
 
-        if not email:
-            return Response({"detail": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
+        if not identifier:
+            return Response({"detail": "Email or username is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         generic_response = Response(
-            {"detail": "If that email exists, a reset OTP has been sent."},
+            {"detail": "If that account exists, a reset OTP has been sent."},
             status=status.HTTP_200_OK,
         )
 
-        try:
-            user = User.objects.get(email__iexact=email)
-        except User.DoesNotExist:
+        # Use your built-in robust identifier helper instead of strict email get
+        user = _get_user_by_identifier(identifier)
+        if not user:
             return generic_response
 
         otp = generate_otp()
