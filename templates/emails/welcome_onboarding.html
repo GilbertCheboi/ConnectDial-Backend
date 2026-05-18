@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to ConnectDial</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+        
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f4f7;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+        .container {
+            max-width: 600px;
+            margin: 20px auto;
+            background-color: #ffffff;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            body { background-color: #121212; }
+            .container {
+                background-color: #1e1e1e;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            }
+            .content { color: #e0e0e0; }
+            .footer { background-color: #181818; color: #aaaaaa; }
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a73e8, #4285f4);
+            color: white;
+            padding: 35px 40px;
+            text-align: center;
+        }
+        .content {
+            padding: 40px;
+            color: #333333;
+            line-height: 1.7;
+        }
+        .button {
+            display: inline-block;
+            background-color: #1a73e8;
+            color: white;
+            padding: 16px 32px;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 16px;
+            margin: 25px 0;
+        }
+        .footer {
+            background-color: #f8f9fa;
+            padding: 25px 40px;
+            text-align: center;
+            font-size: 14px;
+            color: #666666;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .footer { background-color: #181818; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>Welcome to ConnectDial!</h1>
+        </div>
+
+        <!-- Content -->
+        <div class="content">
+            <h2>Hi {{ user.username|default:user.email }},</h2>
+            
+            <p>Thank you for joining ConnectDial! 🎉</p>
+            
+            <p>We're excited to have you here. To get the best experience, please complete your profile and tell us about your favorite teams and leagues.</p>
+
+            <p><strong>Next Steps:</strong></p>
+            <ul>
+                <li>Upload a profile picture</li>
+                <li>Add your favorite teams & leagues</li>
+                <li>Follow interesting accounts</li>
+            </ul>
+
+            <a href="https://api.connectdial.com/auth/onboarding/" class="button" style="color: white;">
+                Complete Your Profile →
+            </a>
+
+            <p style="margin-top: 30px;">
+                Completing your profile helps us show you better content and connect you with the right community.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>© 2026 ConnectDial. All rights reserved.</p>
+            <p>Ruiru, Kenya</p>
+        </div>
+    </div>
+</body>
+</html>

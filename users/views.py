@@ -26,6 +26,7 @@ import io
 import base64
 import hmac
 import hashlib
+import logging
 from datetime import timedelta
 
 from django.core.mail import send_mail
@@ -125,20 +126,33 @@ def generate_otp(length=6):
     return "".join(random.choices(string.digits, k=length))
 
 
+from django.template.loader import render_to_string
+from django.core.mail import send_mail
+
 def send_otp_email(user, otp_code, subject, purpose_label):
-    """Send an OTP email to the given user."""
+    """Send HTML email with OTP"""
+    context = {
+        'user': user,
+        'otp': otp_code,
+    }
+
+    html_message = render_to_string('emails/password_reset_otp.html', context)
+    plain_message = f"""
+    Hi {user.username or user.email},
+
+    Your password reset code is: {otp_code}
+
+    This code expires in 15 minutes.
+    """
+
     send_mail(
         subject=subject,
-        message=(
-            f"Hi {user.username},\n\n"
-            f"Your {purpose_label} code is: {otp_code}\n\n"
-            f"This code expires in 5 minutes."
-        ),
+        message=plain_message,
         from_email=settings.DEFAULT_FROM_EMAIL,
         recipient_list=[user.email],
+        html_message=html_message,
         fail_silently=False,
     )
-
 
 OTP_PURPOSE_META = {
     'login':          {'label': 'one-time login',     'subject': 'Your Login OTP'},
@@ -271,6 +285,53 @@ def _token_response(user, extra=None):
         payload.update(extra)
     return payload
 
+logger = logging.getLogger(__name__)
+
+def send_welcome_email(user):
+    """Send welcome email only once per user"""
+    if not user.email:
+        logger.warning(f"Cannot send welcome email to user {user.id} - no email")
+        return
+
+    profile, created = Profile.objects.get_or_create(user=user)
+
+    if profile.welcome_email_sent:
+        logger.info(f"Welcome email already sent to {user.email} - skipping")
+        return
+
+    try:
+        context = {'user': user}
+
+        html_message = render_to_string('emails/welcome_onboarding.html', context)
+
+        plain_message = f"""
+        Hi {user.username or user.email},
+
+        Welcome to ConnectDial! 🎉
+
+        Please complete your profile to get the best experience.
+
+        Best regards,
+        The ConnectDial Team
+        """
+
+        send_mail(
+            subject='Welcome to ConnectDial! Complete Your Profile',
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+
+        profile.welcome_email_sent = True
+        profile.save(update_fields=['welcome_email_sent'])
+
+        logger.info(f"✅ Welcome email sent successfully to {user.email}")
+
+    except Exception as e:
+        logger.error(f"Failed to send welcome email to {user.email}")
+        logger.error(traceback.format_exc())
 
 # ─────────────────────────────────────────────
 # EMAIL VERIFICATION
@@ -440,34 +501,47 @@ class ForgotPasswordView(APIView):
     throttle_classes   = [PasswordResetThrottle]
 
     def post(self, request):
-        # Change 'email' to a generic identifier lookup
-        identifier = request.data.get("email", "").strip() 
+        identifier = request.data.get("email", "").strip()
 
         if not identifier:
-            return Response({"detail": "Email or username is required."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Email or username is required."}, 
+                          status=status.HTTP_400_BAD_REQUEST)
 
         generic_response = Response(
             {"detail": "If that account exists, a reset OTP has been sent."},
             status=status.HTTP_200_OK,
         )
 
-        # Use your built-in robust identifier helper instead of strict email get
         user = _get_user_by_identifier(identifier)
         if not user:
+            return generic_response
+
+        # Safety check
+        if not user.email:
+            logger.error(f"User {user.username} has no email address")
             return generic_response
 
         otp = generate_otp()
         OTPCode.objects.filter(user=user, purpose="password_reset").delete()
         OTPCode.objects.create(
-            user=user, code=otp, purpose="password_reset",
+            user=user, 
+            code=otp, 
+            purpose="password_reset",
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
         meta = _otp_meta("password_reset")
-        send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
+
+        # === CRITICAL: Catch email errors ===
+        try:
+            send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
+            logger.info(f"Password reset OTP sent to {user.email}")
+        except Exception as e:
+            logger.error(f"Failed to send password reset email to {user.email}")
+            logger.error(traceback.format_exc())
+            # Still return success message (security best practice)
+
         return generic_response
-
-
 class ResetPasswordView(APIView):
     """POST /auth/password/reset/ — Body: { "reset_token": "...", "new_password": "..." }"""
     permission_classes = [AllowAny]
@@ -737,6 +811,8 @@ class GoogleSignInView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+                # ... existing code ...
+
         try:
             user    = User.objects.get(email__iexact=email)
             created = False
@@ -755,6 +831,10 @@ class GoogleSignInView(APIView):
 
         SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
         _log_login(user, request)
+
+        # Send welcome email ONLY for first-time users and only once
+        if created:
+            send_welcome_email(user)
 
         return Response(
             _token_response(user, {'is_new_user': created}),
@@ -1028,3 +1108,40 @@ class UserFollowingListView(generics.ListAPIView):
             ).select_related('user')
         except User.DoesNotExist:
             return Profile.objects.none()
+# ─────────────────────────────────────────────
+# RESEND WELCOME EMAIL (Manual)
+# ─────────────────────────────────────────────
+
+class ResendWelcomeEmailView(APIView):
+    """POST /auth/welcome/resend/ 
+    Allows authenticated users to resend their welcome email"""
+    authentication_classes = [TokenAuthentication]
+    permission_classes     = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        profile, _ = Profile.objects.get_or_create(user=user)
+
+        if not user.email:
+            return Response({"detail": "No email address associated with this account."}, 
+                          status=status.HTTP_400_BAD_REQUEST)
+
+        # Temporarily allow resend
+        was_sent = profile.welcome_email_sent
+        profile.welcome_email_sent = False
+        profile.save(update_fields=['welcome_email_sent'])
+
+        try:
+            send_welcome_email(user)
+            return Response({
+                "detail": "Welcome email has been resent successfully.",
+                "email": user.email
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            # Restore flag if sending failed
+            profile.welcome_email_sent = was_sent
+            profile.save(update_fields=['welcome_email_sent'])
+            logger.error(f"Resend welcome email failed for {user.email}")
+            return Response({
+                "detail": "Failed to send welcome email. Please try again later."
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

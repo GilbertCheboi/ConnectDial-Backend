@@ -84,7 +84,8 @@ class Profile(models.Model):
     totp_secret = models.CharField(max_length=64, blank=True, null=True)
     two_fa_enabled = models.BooleanField(default=False)
     email_verified = models.BooleanField(default=False)
-
+    # NEW FIELD — Prevents sending welcome email multiple times
+    welcome_email_sent = models.BooleanField(default=False)
     def __str__(self):
         return f"Profile({self.user.username})"
 
