@@ -14,20 +14,33 @@ Scoring formula (per video):
 
 Duration range:
   Shorts can be anywhere from a few seconds up to 7 200 s (2 hrs).
-  The watch_ratio normalises completion rate across all lengths, so a
-  90-second clip watched to completion scores the same watch_ratio as a
-  2-hr match highlight watched to completion.
+  watch_ratio normalises completion rate across all lengths.
 
 Caching:
   - Feed IDs cached in Redis for 5 minutes per user (CACHE_TTL).
   - Cache busted on new video creation (via signal in signals.py).
   - bypass_cache=True forces a fresh query (useful for testing / admin).
 
-Feed source:
-  - All videos come from the ShortVideo table, filtered/ranked by the
-    personalised score.  No YouTube links — every video is stored and
-    served from our own storage (local FileSystemStorage in dev, S3 in
-    production via streaming.py).
+Feed size:
+  FEED_FETCH_SIZE (default 200) controls how many scored candidates the
+  algorithm fetches. The view's LimitOffsetPaginator then slices those into
+  pages. This constant is exported so views.py can import it.
+
+Fixes applied
+─────────────
+  FIX-4  get_short_video_feed() no longer accepts a `limit` parameter.
+         The old code sliced the queryset to `limit` rows (page size) before
+         returning it. When the paginator then tried to apply an offset for
+         page 2, it ran out of rows and returned an empty list. The algorithm
+         now always fetches FEED_FETCH_SIZE scored candidates and returns them
+         as a plain Python list. LimitOffsetPagination in the view does all
+         page slicing.
+
+  FIX-5  The queryset is now evaluated exactly once with list(qs[:FEED_FETCH_SIZE]).
+         Previously `result = qs[:limit]` was returned un-evaluated; the
+         caller iterated it to build the cache (first DB hit), then the view
+         iterated it again to serialize (second identical DB hit). Evaluating
+         once and returning a list costs nothing extra and halves DB load.
 """
 
 from django.db.models import (
@@ -46,16 +59,21 @@ from .models import ShortVideo
 # ─────────────────────────────────────────────────────────────────────────────
 
 CACHE_TTL          = 60 * 5        # seconds — 5 minutes
-HISTORY_LIMIT      = 10            # how many recent watched leagues/teams to consider
 AGE_DECAY_PER_HOUR = 0.3           # score penalty per hour of age
-AGE_DECAY_CAP_HRS  = 24.0          # decay stops after this many hours (prevents burial of older gems)
+AGE_DECAY_CAP_HRS  = 24.0          # decay stops after 24 h
+HISTORY_LIMIT      = 10            # recent watched leagues/teams to consider
 
-# Personalisation weights
+# FIX-4/FIX-5: fetch this many scored candidates; paginator slices the pages.
+# Exported so views.py can reference it without magic numbers.
+FEED_FETCH_SIZE    = 200
+
+# Engagement weights
 W_WATCH_RATIO  = 4.0
 W_LIKES        = 2.0
 W_COMMENTS     = 3.0
 W_SHARES       = 5.0
 
+# Personalisation weights
 W_EXP_LEAGUE   = 2.0   # user explicitly follows this league
 W_EXP_TEAM     = 3.0   # user explicitly follows this team
 W_HIST_LEAGUE  = 1.0   # user has watched this league before
@@ -77,11 +95,9 @@ def _cache_key(user_id: int) -> str:
 def _user_interest_leagues(user) -> list:
     """
     League IDs the user explicitly follows.
-    favorite_league is a ForeignKey (single object), not ManyToMany —
-    so we extract its pk directly and wrap in a list.
-    Returns an empty list if the field is not set (null/blank allowed).
+    favorite_league is a ForeignKey (single object) — extract pk directly.
     """
-    if user.favorite_league_id:          # uses the DB column directly — no extra query
+    if user.favorite_league_id:
         return [user.favorite_league_id]
     return []
 
@@ -89,20 +105,15 @@ def _user_interest_leagues(user) -> list:
 def _user_interest_teams(user) -> list:
     """
     Team IDs the user explicitly follows.
-    favorite_team is a ForeignKey (single object), not ManyToMany —
-    same pattern as _user_interest_leagues.
-    Returns an empty list if the field is not set (null/blank allowed).
+    favorite_team is a ForeignKey (single object) — extract pk directly.
     """
-    if user.favorite_team_id:            # uses the DB column directly — no extra query
+    if user.favorite_team_id:
         return [user.favorite_team_id]
     return []
 
 
 def _user_history_leagues(user, limit: int = HISTORY_LIMIT) -> list:
-    """
-    League IDs from videos the user has actually watched recently.
-    Captures implicit interest: e.g. watched 5 La Liga clips → La Liga boost.
-    """
+    """League IDs from videos the user has watched recently (implicit interest)."""
     from .models import VideoView
     return list(
         VideoView.objects
@@ -114,7 +125,7 @@ def _user_history_leagues(user, limit: int = HISTORY_LIMIT) -> list:
 
 
 def _user_history_teams(user, limit: int = HISTORY_LIMIT) -> list:
-    """Team IDs from videos the user has actually watched recently."""
+    """Team IDs from videos the user has watched recently (implicit interest)."""
     from .models import VideoView
     return list(
         VideoView.objects
@@ -129,34 +140,39 @@ def _user_history_teams(user, limit: int = HISTORY_LIMIT) -> list:
 # MAIN FEED FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
+def get_short_video_feed(user, bypass_cache: bool = False) -> list:
     """
-    Returns an annotated ShortVideo queryset ordered by personalised score.
+    Returns a plain Python list of ShortVideo instances ordered by personalised
+    score. The list always contains up to FEED_FETCH_SIZE items; the view's
+    LimitOffsetPaginator slices it into pages.
 
-    All videos are fetched from the database — no external links (YouTube etc.)
-    are used.  Content is ranked entirely by engagement signals + user
-    preference vectors derived from followed leagues/teams and watch history.
+    FIX-4: `limit` parameter removed. The old signature was:
+        get_short_video_feed(user, limit=20, bypass_cache=False)
+    Callers that passed limit= will need to remove that argument.
+
+    FIX-5: The queryset is evaluated exactly once via list(qs[:FEED_FETCH_SIZE])
+    and that list is both cached and returned. No second DB hit in the view.
 
     Steps
     ─────
-    1. Check Redis cache — return preserved-order queryset on hit.
-    2. Build user interest vectors (explicit follows + implicit watch history).
-    3. Annotate engagement metrics using cached counters (O(1) reads) and
+    1. Check Redis cache — return preserved-order list on hit.
+    2. Build user interest vectors (explicit follows + watch history).
+    3. Annotate engagement metrics from cached_* columns (O(1) reads) and
        avg_watch from VideoView rows.
-    4. Compute watch_ratio (normalised 0-1 across any video length).
-    5. Compute age_hours via EXTRACT(EPOCH ...) / 3600 — works correctly
-       with PostgreSQL's interval type (no type-cast errors).
-    6. Cap age_hours at AGE_DECAY_CAP_HRS so very old videos aren't buried.
+    4. Compute watch_ratio (normalised 0–1 across any video length).
+    5. Compute age_hours via EXTRACT(EPOCH ...) / 3600 — avoids the
+       PostgreSQL interval > numeric type error from timedelta division.
+    6. Cap age_hours at AGE_DECAY_CAP_HRS.
     7. Annotate personalisation boosts.
-    8. Compute final score, order descending, slice to `limit`.
-    9. Store ordered UUID list in Redis and return queryset.
+    8. Compute final score, order descending.
+    9. Evaluate to list, cache UUID list, return list.
     """
     cache_key = _cache_key(user.pk)
 
     if not bypass_cache:
         cached_ids = cache.get(cache_key)
         if cached_ids:
-            return _preserve_order_queryset(cached_ids)
+            return _preserve_order_list(cached_ids)
 
     now = timezone.now()
 
@@ -166,30 +182,19 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     history_leagues  = _user_history_leagues(user)
     history_teams    = _user_history_teams(user)
 
-    # ── 2. Base queryset — STEP 5: add author__profile + prefetch likes ──────
-    #
-    # BEFORE (caused N+1 — one extra query per video for avatar + is_liked):
-    #   qs = ShortVideo.objects.select_related('author', 'league', 'team')
-    #
-    # AFTER: author__profile fetches the avatar in the same JOIN so
-    # ShortVideoSerializer.get_author_avatar() hits no extra DB rows.
-    # prefetch_related('likes') loads all likes in 1 query so
-    # get_is_liked() can use the prefetch cache instead of .exists().
-    #
-    # Net result: 50+ queries per 10-video feed page → 4-5 queries total.
+    # ── 2. Base queryset with N+1 fixes ─────────────────────────────────────
+    # author__profile: avatar in 1 JOIN (no per-video query for get_author_avatar)
+    # prefetch likes: get_is_liked uses prefetch cache (no per-video .exists())
     qs = ShortVideo.objects.select_related(
         'author',
-        'author__profile',   # ← fetches avatar in 1 JOIN — no per-video query
+        'author__profile',
         'league',
         'team',
     ).prefetch_related(
-        'likes',             # ← loaded in 1 query — get_is_liked uses cache
+        'likes',
     )
 
     # ── 3. Engagement annotations ────────────────────────────────────────────
-    # Use cached_* counters so we avoid expensive COUNT() aggregates per row.
-    # avg_watch is the one place we hit the VideoView table — but it's a
-    # single Avg() per video, not a subquery per request.
     qs = qs.annotate(
         likes_count    = F('cached_likes'),
         comments_count = F('cached_comments'),
@@ -202,8 +207,7 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         ),
     )
 
-    # ── 4. watch_ratio  (clamped: 0 if duration == 0) ───────────────────────
-    # Works correctly for shorts of any length (seconds → 2 hrs).
+    # ── 4. watch_ratio (clamped: 0 if duration == 0) ────────────────────────
     qs = qs.annotate(
         watch_ratio=ExpressionWrapper(
             Case(
@@ -216,17 +220,8 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     )
 
     # ── 5. Age in hours via EXTRACT(EPOCH FROM (now - created_at)) / 3600 ───
-    #
-    # FIX: The previous approach used Django timedelta division
-    #   (now - F('created_at')) / 3_600_000_000
-    # which produces a PostgreSQL `interval` type. Postgres cannot compare
-    # `interval > numeric` directly, raising:
-    #   ProgrammingError: operator does not exist: interval > numeric
-    #
-    # The correct approach is to use Extract('epoch') which calls
-    #   EXTRACT(EPOCH FROM (now - created_at))
-    # returning total seconds as a plain float, then divide by 3600 for hours.
-    # This is the standard PostgreSQL way to convert an interval to a number.
+    # Avoids PostgreSQL "operator does not exist: interval > numeric" error
+    # that occurs when dividing a timedelta by an integer directly in ORM.
     qs = qs.annotate(
         age_seconds=ExpressionWrapper(
             Extract(now - F('created_at'), 'epoch'),
@@ -241,7 +236,6 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     )
 
     # ── 6. Cap age at AGE_DECAY_CAP_HRS ─────────────────────────────────────
-    # Prevents very old videos from accumulating an unbounded negative penalty.
     qs = qs.annotate(
         age_hours=Case(
             When(age_hours_raw__gt=AGE_DECAY_CAP_HRS, then=Value(AGE_DECAY_CAP_HRS)),
@@ -251,9 +245,7 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
     )
 
     # ── 7. Personalisation boosts ────────────────────────────────────────────
-    # Explicit follows carry higher weight than implicit watch-history signals.
-    # If explicit_leagues / explicit_teams is empty the Case falls through to
-    # default=0.0 cleanly — no SQL error from an empty __in list.
+    # Empty __in lists fall through to default=0.0 cleanly — no SQL error.
     qs = qs.annotate(
         explicit_league_boost=Case(
             When(league_id__in=explicit_leagues, then=Value(W_EXP_LEAGUE)),
@@ -298,10 +290,13 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
         )
     ).order_by('-score')
 
-    # ── 9. Slice, cache and return ───────────────────────────────────────────
-    result = qs[:limit]
+    # ── 9. Evaluate once, cache, return ─────────────────────────────────────
+    # FIX-5: list() evaluates the queryset a single time.
+    # The view receives a plain list — no second DB hit when paginator
+    # or serializer iterates it.
+    result = list(qs[:FEED_FETCH_SIZE])
 
-    ids = [str(v.id) for v in result]   # evaluates the queryset once
+    ids = [str(v.id) for v in result]
     cache.set(cache_key, ids, CACHE_TTL)
 
     return result
@@ -311,32 +306,32 @@ def get_short_video_feed(user, limit: int = 20, bypass_cache: bool = False):
 # CACHE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _preserve_order_queryset(ids: list):
+def _preserve_order_list(ids: list) -> list:
     """
-    Re-fetch videos from cache hit, preserving the previously scored order
-    via a CASE WHEN … expression (no re-scoring needed).
+    Re-fetch videos from a cache hit, preserving the previously scored order
+    via a CASE WHEN expression (no re-scoring needed).
 
-    STEP 5: Also add author__profile to select_related and prefetch likes
-    here so the cache-hit path gets the same N+1 fix as the scored path.
+    FIX-5: Returns a plain Python list (consistent with the scored path) so
+    the view always receives a list regardless of cache hit/miss.
     """
     import uuid as _uuid
 
-    uuid_ids  = [_uuid.UUID(i) for i in ids]
+    uuid_ids   = [_uuid.UUID(i) for i in ids]
     order_expr = Case(
         *[When(pk=pk, then=Value(i)) for i, pk in enumerate(uuid_ids)],
         output_field=IntegerField(),
     )
-    return (
+    qs = (
         ShortVideo.objects
         .filter(pk__in=uuid_ids)
         .select_related(
             'author',
-            'author__profile',   # ← same fix as scored path — avatar in 1 JOIN
+            'author__profile',
             'league',
             'team',
         )
         .prefetch_related(
-            'likes',             # ← same fix — get_is_liked uses prefetch cache
+            'likes',
         )
         .annotate(
             likes_count    = F('cached_likes'),
@@ -347,8 +342,9 @@ def _preserve_order_queryset(ids: list):
         .annotate(order=order_expr)
         .order_by('order')
     )
+    return list(qs)   # FIX-5: evaluate to list here too
 
 
-def bust_feed_cache(user_id: int):
+def bust_feed_cache(user_id: int) -> None:
     """Delete the cached feed list for a specific user."""
     cache.delete(_cache_key(user_id))

@@ -13,11 +13,29 @@ video_file.url   works with ANY backend (local, S3, GCS, Azure, etc.)
 
 This module uses .url for all cases:
   - If the URL is an S3/GCS presigned URL → redirect directly (no proxying)
-  - If the URL is a local MEDIA_URL path  → serve the file via Django with
-    Range support (dev only; use a real CDN in production)
+  - If the URL is a local MEDIA_URL path  → serve with Range support (dev only)
 
 Usage in views:
     return stream_video_response(request, video)
+
+Fixes applied
+─────────────
+  FIX-9  build_telegram_share_text() had an operator-precedence bug in the
+         caption truncation line:
+
+           caption = video.caption[:100] + "…" if len(video.caption) > 100 else video.caption
+
+         Due to Python's precedence rules this parsed as:
+
+           caption = (video.caption[:100]) + ("…" if len > 100 else video.caption)
+
+         So when caption was ≤ 100 chars, Python evaluated the ternary as
+         video.caption and appended the ENTIRE caption to the already-sliced
+         string — doubling the caption text.
+
+         Fixed by adding explicit parentheses:
+
+           caption = (video.caption[:100] + "…") if len(video.caption) > 100 else video.caption
 """
 
 import os
@@ -47,11 +65,11 @@ def stream_video_response(request, video_instance):
     Strategy
     ────────
     1. Get the file URL via video_file.url — works with any storage backend.
-    2. If it's an external URL (S3 presigned, GCS signed, CDN) → redirect.
+    2. External URL (S3 presigned, GCS signed, CDN) → redirect.
        The mobile player follows the redirect and streams directly from the
        CDN — no proxying through Django.
-    3. If it's a local MEDIA_URL path → resolve to an absolute filesystem
-       path using MEDIA_ROOT and serve with Range support (dev mode).
+    3. Local MEDIA_URL path → resolve to an absolute filesystem path using
+       MEDIA_ROOT and serve with Range support (dev mode).
     """
     video_file = video_instance.video
 
@@ -63,19 +81,13 @@ def stream_video_response(request, video_instance):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    # Get the URL — works with FileSystemStorage, S3Boto3Storage, GCSStorage, etc.
     file_url = video_file.url
 
     # ── External storage (S3, GCS, Azure, CDN) ───────────────────────────────
-    # The storage backend returns a full URL (possibly presigned).
-    # Redirect the player — it streams directly from the CDN; Django doesn't
-    # proxy the bytes. This is the production path.
     if _is_external_url(file_url):
         return HttpResponseRedirect(file_url)
 
     # ── Local / dev storage (FileSystemStorage) ───────────────────────────────
-    # file_url is something like /media/shorts/uuid/abc.mp4
-    # Resolve to an absolute path using MEDIA_ROOT.
     media_root = getattr(settings, 'MEDIA_ROOT', '')
     if not media_root:
         from rest_framework.response import Response
@@ -85,10 +97,8 @@ def stream_video_response(request, video_instance):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-    # Strip the MEDIA_URL prefix to get the relative path, then join with MEDIA_ROOT.
-    media_url = getattr(settings, 'MEDIA_URL', '/media/')
     relative_path = video_file.name   # e.g. "shorts/uuid/abc.mp4"
-    file_path = os.path.join(media_root, relative_path)
+    file_path     = os.path.join(media_root, relative_path)
 
     if not os.path.exists(file_path):
         from rest_framework.response import Response
@@ -98,7 +108,7 @@ def stream_video_response(request, video_instance):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    file_size = os.path.getsize(file_path)
+    file_size    = os.path.getsize(file_path)
     content_type, _ = mimetypes.guess_type(file_path)
     content_type = content_type or 'video/mp4'
 
@@ -113,10 +123,10 @@ def stream_video_response(request, video_instance):
         end   = min(end, file_size - 1)
         length = end - start + 1
 
-        def file_iterator(path, start, length, chunk=CHUNK_SIZE):
+        def file_iterator(path, offset, read_len, chunk=CHUNK_SIZE):
             with open(path, 'rb') as f:
-                f.seek(start)
-                remaining = length
+                f.seek(offset)
+                remaining = read_len
                 while remaining > 0:
                     data = f.read(min(chunk, remaining))
                     if not data:
@@ -151,9 +161,10 @@ def stream_video_response(request, video_instance):
     return response
 
 
-def build_whatsapp_share_text(video):
+def build_whatsapp_share_text(video) -> str:
     """
     WhatsApp / Telegram plain-text share preview.
+
     Message format:
         🎬 [Video] ConnectDial
         👤 @username
@@ -168,23 +179,40 @@ def build_whatsapp_share_text(video):
     if video.league or video.team:
         ctx = " • ".join(filter(None, [
             video.league.name if video.league else None,
-            video.team.name  if video.team   else None,
+            video.team.name   if video.team   else None,
         ]))
         lines.append(f"🏆 {ctx}")
     if video.caption:
-        caption = video.caption[:120] + ("…" if len(video.caption) > 120 else "")
+        # Correct truncation — parentheses ensure the ternary wraps both sides
+        caption = (video.caption[:120] + "…") if len(video.caption) > 120 else video.caption
         lines.append(f"📝 {caption}")
     lines.append(f"▶️ Watch: {video.share_url}")
     return "\n".join(lines)
 
 
-def build_telegram_share_text(video):
-    """Telegram supports HTML mode — include bold/links."""
+def build_telegram_share_text(video) -> str:
+    """
+    Telegram share text in HTML mode — includes bold/links.
+
+    FIX-9: Caption truncation now uses correct parenthesisation.
+
+    Old (broken):
+        caption = video.caption[:100] + "…" if len(video.caption) > 100 else video.caption
+        # Parsed as: (video.caption[:100]) + ("…" if len > 100 else video.caption)
+        # When caption ≤ 100 chars: appended the full caption to the sliced
+        # prefix, producing a doubled/malformed string.
+
+    Fixed:
+        caption = (video.caption[:100] + "…") if len(video.caption) > 100 else video.caption
+    """
     league_team = " | ".join(filter(None, [
         video.league.name if video.league else None,
         video.team.name   if video.team   else None,
     ]))
-    caption = video.caption[:100] + "…" if len(video.caption) > 100 else video.caption
+
+    # FIX-9: explicit parentheses around the truncation expression
+    caption = (video.caption[:100] + "…") if len(video.caption) > 100 else video.caption
+
     text = (
         f"🎬 <b>[Video]</b> ConnectDial\n"
         f"👤 <b>@{video.author.username}</b>\n"

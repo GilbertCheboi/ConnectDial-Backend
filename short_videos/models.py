@@ -2,20 +2,29 @@
 ConnectDial — Short Video Models
 =================================
 Covers:
-  - ShortVideo        : the core video entity (0s – 7200s / 2hrs)
+  - ShortVideo        : the core video entity (0s – 7200s / 2 hrs)
   - VideoLike         : user like on a video
   - VideoComment      : threaded comment with @mention tagging
   - CommentMention    : M2M through-table for @tagged users in comments
   - VideoShare        : share action
   - VideoView         : view event with watch_time for completion tracking
+
+Fixes applied
+─────────────
+  FIX-2  Added ('reshare', 'In-App Reshare') to VideoShare.PLATFORM_CHOICES.
+         VideoReshareView now uses platform='reshare' as its dedicated sentinel
+         value. Previously it used 'other', which collided with the catch-all
+         external-share choice and caused in-app reshares to be accidentally
+         toggled off when a user also had an 'other' external share on the
+         same video.
 """
 
 import uuid
 from django.db import models
 from django.conf import settings
 from django.utils import timezone
-from django.db.models import Count
 from leagues.models import League, Team
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -39,29 +48,28 @@ class ShortVideo(models.Model):
     issues aggregate COUNT() queries at read time.
     """
 
-    id          = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    author      = models.ForeignKey(
+    id       = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    author   = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='short_videos',
     )
 
-    video       = models.FileField(upload_to=short_video_upload_path)
-    thumbnail   = models.ImageField(upload_to='shorts/thumbnails/', blank=True, null=True)
-    caption     = models.TextField(blank=True, max_length=2200)
+    video     = models.FileField(upload_to=short_video_upload_path)
+    thumbnail = models.ImageField(upload_to='shorts/thumbnails/', blank=True, null=True)
+    caption   = models.TextField(blank=True, max_length=2200)
 
-    # Contextual tags — both optional
-    league      = models.ForeignKey(
+    league = models.ForeignKey(
         'leagues.League', null=True, blank=True,
         on_delete=models.SET_NULL, related_name='short_videos',
     )
     team = models.ForeignKey(
-            'leagues.Team', null=True, blank=True,
-            on_delete=models.SET_NULL, related_name='short_videos'
-        )
+        'leagues.Team', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='short_videos',
+    )
 
     # Duration in seconds — 0 to 7200 (2 hrs)
-    duration    = models.PositiveIntegerField(
+    duration = models.PositiveIntegerField(
         default=0,
         help_text="Video duration in seconds (0 – 7200).",
     )
@@ -72,14 +80,14 @@ class ShortVideo(models.Model):
     cached_shares   = models.PositiveIntegerField(default=0)
     cached_views    = models.PositiveIntegerField(default=0)
 
-    created_at  = models.DateTimeField(default=timezone.now, db_index=True)
-    updated_at  = models.DateTimeField(auto_now=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-created_at']
         indexes  = [
             models.Index(fields=['league', '-created_at']),
-            models.Index(fields=['team', '-created_at']),
+            models.Index(fields=['team',   '-created_at']),
             models.Index(fields=['author', '-created_at']),
         ]
 
@@ -92,7 +100,10 @@ class ShortVideo(models.Model):
 
     @property
     def og_title(self):
-        return f"{self.author.username}: {self.caption[:80]}" if self.caption else str(self.id)
+        return (
+            f"{self.author.username}: {self.caption[:80]}"
+            if self.caption else str(self.id)
+        )
 
     @property
     def og_description(self):
@@ -114,8 +125,12 @@ class ShortVideo(models.Model):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VideoLike(models.Model):
-    user    = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='video_likes')
-    video   = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='likes')
+    user  = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='video_likes',
+    )
+    video = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='likes')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -131,24 +146,23 @@ class VideoComment(models.Model):
       (see signals.py) and stored in the CommentMention through-table.
 
     NOTE: The DB column for `author` is `user_id` (legacy name from initial
-    migration). We keep the Python attribute as `author` for readability and
-    use db_column='user_id' to bridge the mismatch without a schema migration.
+    migration). We keep the Python attribute as `author` and use
+    db_column='user_id' to bridge the mismatch without a schema migration.
     """
-    id      = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    video   = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='comments')
-    author  = models.ForeignKey(
+    id     = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    video  = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='comments')
+    author = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='video_comments',
-        db_column='user_id',   # ← actual column in short_videos_videocomment
+        db_column='user_id',
     )
-    parent  = models.ForeignKey(
+    parent = models.ForeignKey(
         'self', null=True, blank=True,
         on_delete=models.CASCADE, related_name='replies',
     )
-    body    = models.TextField(max_length=1000, db_column='text')
+    body = models.TextField(max_length=1000, db_column='text')
 
-    # @mentioned users resolved at save time
     mentioned_users = models.ManyToManyField(
         settings.AUTH_USER_MODEL,
         through='CommentMention',
@@ -171,13 +185,13 @@ class VideoComment(models.Model):
 
 class CommentMention(models.Model):
     """Through-model recording which users were @tagged in a comment."""
-    comment     = models.ForeignKey(VideoComment, on_delete=models.CASCADE, related_name='mentions')
-    user        = models.ForeignKey(
+    comment    = models.ForeignKey(VideoComment, on_delete=models.CASCADE, related_name='mentions')
+    user       = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name='mentioned_in_comments',
     )
-    created_at  = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ('comment', 'user')
@@ -187,6 +201,15 @@ class CommentMention(models.Model):
 
 
 class VideoShare(models.Model):
+    """
+    Records a share action — either an external platform share or an in-app
+    reshare.
+
+    FIX-2: Added 'reshare' as a dedicated PLATFORM_CHOICES entry.
+    VideoReshareView uses platform='reshare' as its sentinel value instead of
+    'other'. This prevents the collision where an external 'other' share would
+    be mistaken for an in-app reshare and accidentally toggled off.
+    """
     PLATFORM_CHOICES = [
         ('whatsapp',  'WhatsApp'),
         ('telegram',  'Telegram'),
@@ -194,13 +217,18 @@ class VideoShare(models.Model):
         ('facebook',  'Facebook'),
         ('instagram', 'Instagram'),
         ('copy_link', 'Copy Link'),
+        ('reshare',   'In-App Reshare'),   # FIX-2: dedicated in-app reshare value
         ('other',     'Other'),
     ]
 
-    user        = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='video_shares')
-    video       = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='shares')
-    platform    = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='other')
-    created_at  = models.DateTimeField(auto_now_add=True)
+    user     = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='video_shares',
+    )
+    video    = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='shares')
+    platform = models.CharField(max_length=20, choices=PLATFORM_CHOICES, default='other')
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class VideoView(models.Model):
@@ -211,36 +239,34 @@ class VideoView(models.Model):
     ──────
     watch_time : seconds the user actually watched — used to compute
                  watch_ratio in the feed algorithm.
-    completed  : True if the user watched to (or near) the end of the video.
-                 Computed automatically on save: watch_time >= 90% of duration.
-                 Stored explicitly so signals/analytics can filter on it cheaply
-                 without recomputing the ratio each time.
+    completed  : True if the user watched ≥ 90% of the video.
+                 Computed automatically on save; stored explicitly so
+                 signals/analytics can filter on it without recomputing.
     """
-    user        = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True,
-        on_delete=models.SET_NULL, related_name='video_views',
+    user  = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='video_views',
     )
-    video       = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='views')
-    watch_time  = models.FloatField(default=0.0, help_text="Seconds watched.")
-
-    completed   = models.BooleanField(
+    video      = models.ForeignKey(ShortVideo, on_delete=models.CASCADE, related_name='views')
+    watch_time = models.FloatField(default=0.0, help_text="Seconds watched.")
+    completed  = models.BooleanField(
         default=False,
         help_text="True if watch_time >= 90% of video duration.",
     )
-
-    created_at  = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [
             models.Index(fields=['video', 'created_at']),
-            models.Index(fields=['user', 'created_at']),
+            models.Index(fields=['user',  'created_at']),
         ]
 
     def save(self, *args, **kwargs):
         """
         Auto-compute `completed` before saving.
-        A view counts as completed if the user watched at least 90% of
-        the video. Falls back to False if duration is 0 (unknown length).
+        Falls back to False if duration is 0 (unknown length).
         """
         duration = self.video.duration if self.video_id else 0
         if duration > 0:

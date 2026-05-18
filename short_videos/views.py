@@ -29,16 +29,48 @@ Comments
   GET    /api/videos/shorts/<pk>/comments/<id>/replies/ list replies
   PATCH  /api/videos/comments/<id>/                     edit own comment
   DELETE /api/videos/comments/<id>/                     delete own comment
+
+Fixes applied
+─────────────
+  FIX-1  ShortVideoUploadView now uses ShortVideoCreateSerializer (writable video
+         field) instead of the read-only ShortVideoSerializer, so the video file
+         goes through proper validation rather than being passed as a raw kwarg.
+
+  FIX-2  VideoReshareView now uses platform='reshare' instead of platform='other'.
+         Using 'other' caused any external share with platform='other' to
+         accidentally toggle the in-app reshare off on the next call.
+         'reshare' is a dedicated choice in VideoShare.PLATFORM_CHOICES.
+
+  FIX-3  VideoLikeToggleView.delete() now returns HTTP 200 with a JSON body
+         instead of HTTP 204 No Content. 204 must have no body; returning one
+         causes some clients to silently drop the response data.
+
+  FIX-4  VideoShareRecordView WhatsApp, Telegram, and Twitter share URLs now
+         URL-encode the text/title parameters via urllib.parse.quote so
+         multi-line share text and special characters don't break the URLs.
+
+  FIX-5  ShortVideoFeedView.get_queryset() no longer passes 'limit' to
+         get_short_video_feed(). The feed algorithm now always fetches
+         FEED_FETCH_SIZE (200) candidates; LimitOffsetPagination does all
+         slicing. This prevents the paginator from running out of rows on
+         page 2+ because the algorithm had already sliced to page-1 size.
+
+  FIX-6  compress_video timeout raised from 300 s to 7 200 s (2 hrs) to match
+         the maximum supported video length. A 2-hr upload can easily exceed
+         5 minutes of encoding time.
 """
 
 # ── stdlib ────────────────────────────────────────────────────────────────────
+import io
 import os
 import subprocess
 import tempfile
+from urllib.parse import quote  # FIX-4
 
 # ── Django ────────────────────────────────────────────────────────────────────
 from django.contrib.auth import get_user_model
 from django.core.files.base import ContentFile
+from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.shortcuts import get_object_or_404
 
 # ── DRF ──────────────────────────────────────────────────────────────────────
@@ -49,7 +81,6 @@ from rest_framework.generics import ListAPIView
 from rest_framework.pagination import LimitOffsetPagination
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import (
-    AllowAny,
     IsAuthenticated,
     IsAuthenticatedOrReadOnly,
 )
@@ -57,13 +88,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 # ── Local ─────────────────────────────────────────────────────────────────────
-from .feed_algorithm import get_short_video_feed
+from .feed_algorithm import get_short_video_feed, FEED_FETCH_SIZE
 from .models import ShortVideo, VideoComment, VideoLike, VideoShare, VideoView
 from .serializers import (
     ShortVideoSerializer,
+    ShortVideoCreateSerializer,        # FIX-1
     VideoCommentCreateSerializer,
     VideoCommentSerializer,
-    VideoLikeSerializer,
     VideoShareSerializer,
     VideoViewSerializer,
 )
@@ -77,15 +108,14 @@ User = get_user_model()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Helper: extract video duration with ffprobe
+# HELPERS — ffmpeg / ffprobe
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_duration(file_path: str) -> int:
     """
     Use ffprobe to read the video duration in whole seconds.
-    Returns 0 if ffprobe fails or the output cannot be parsed.
-    Requires: ffprobe (part of the ffmpeg package).
-    Install:  sudo apt-get install ffmpeg
+    Returns 0 if ffprobe is unavailable or the output cannot be parsed.
+    Install: sudo apt-get install ffmpeg
     """
     try:
         result = subprocess.run(
@@ -104,25 +134,14 @@ def extract_duration(file_path: str) -> int:
         return 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — Helper: compress with ffmpeg + -movflags +faststart (HIGH PRIORITY)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def compress_video(input_path: str, output_path: str) -> None:
     """
-    Re-encode the video to H.264/AAC and write the MP4 moov atom (header)
-    to the START of the file using -movflags +faststart.
+    Re-encode to H.264/AAC and write the MP4 moov atom to the START of the
+    file using -movflags +faststart so react-native-video can begin playback
+    in ~1 s without downloading the whole file first.
 
-    WHY THIS MATTERS:
-    Without +faststart, mobile players must download the entire file before
-    playback begins (the moov atom sits at the end). With +faststart, the
-    header is at the front, so react-native-video can start playing in ~1 s
-    even over a slow connection.
-
-    Encoding settings:
-      -crf 28       → quality/size sweet spot (23 = higher quality, 28 = smaller file)
-      -preset fast  → fast encoding; use 'medium' for better compression at the cost of time
-      -b:a 128k     → audio bitrate
+    FIX-6: Timeout raised to 7 200 s (2 hrs) to match the maximum supported
+    video length. 2-hr 1080p content can easily exceed 5 minutes of encoding.
     """
     subprocess.run(
         [
@@ -132,26 +151,19 @@ def compress_video(input_path: str, output_path: str) -> None:
             '-preset', 'fast',
             '-acodec', 'aac',
             '-b:a', '128k',
-            '-movflags', '+faststart',   # ← THE KEY FLAG — moov atom at file start
-            '-y',                        # overwrite output without asking
+            '-movflags', '+faststart',
+            '-y',
             output_path,
         ],
         check=True,
-        timeout=300,                     # 5-minute hard limit per video
+        timeout=7200,   # FIX-6: was 300 — far too short for 2-hr videos
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — Helper: auto-generate thumbnail from video frame at 1 s
-# ─────────────────────────────────────────────────────────────────────────────
-
 def generate_thumbnail(video_path: str) -> bytes:
     """
-    Extract a single frame at the 1-second mark and return it as JPEG bytes.
-    The frame is scaled to 480 px wide (height proportional).
-
-    Returns raw JPEG bytes that can be passed directly to Django's
-    FieldFile.save(name, ContentFile(bytes), save=True).
+    Extract a single frame at the 1-second mark as JPEG bytes (480 px wide).
+    Returns raw bytes suitable for ContentFile / FieldFile.save().
     """
     thumb_path = None
     try:
@@ -161,9 +173,9 @@ def generate_thumbnail(video_path: str) -> bytes:
         subprocess.run(
             [
                 'ffmpeg', '-i', video_path,
-                '-ss', '00:00:01',       # seek to 1 second
-                '-vframes', '1',         # grab exactly 1 frame
-                '-vf', 'scale=480:-1',   # 480 px wide, auto height
+                '-ss', '00:00:01',
+                '-vframes', '1',
+                '-vf', 'scale=480:-1',
                 '-y', thumb_path,
             ],
             check=True,
@@ -178,14 +190,14 @@ def generate_thumbnail(video_path: str) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Upload view  (uses helpers from Steps 1, 2, 3)
+# UPLOAD
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ShortVideoUploadView(generics.CreateAPIView):
     """
     POST /api/videos/shorts/upload/
 
-    Accepts multipart/form-data with:
+    Accepts multipart/form-data:
       video    (required) : video file
       caption  (optional) : text caption
       league   (optional) : league FK
@@ -195,15 +207,32 @@ class ShortVideoUploadView(generics.CreateAPIView):
       1. Write upload to a temp file.
       2. Compress with ffmpeg (-movflags +faststart) → new temp file.
       3. Extract duration from the compressed file.
-      4. Save the compressed file as the model's `video` field.
+      4. Save the compressed file via ShortVideoCreateSerializer.
       5. Auto-generate a thumbnail if none was provided.
-      6. Return the full ShortVideoSerializer payload.
+      6. Return the full ShortVideoSerializer read payload.
 
-    Temp files are always cleaned up, even on failure.
+    FIX-1: Uses ShortVideoCreateSerializer (writable video field) instead of
+    the read-only ShortVideoSerializer. The compressed InMemoryUploadedFile is
+    passed through the serializer's validated_data so the storage backend
+    (local / S3 / GCS) saves it correctly and any per-field validation runs.
     """
-    serializer_class  = ShortVideoSerializer
+    # FIX-1: write with the create serializer; read response built separately
+    serializer_class   = ShortVideoCreateSerializer
     permission_classes = [IsAuthenticated]
     parser_classes     = [MultiPartParser, FormParser]
+
+    def create(self, request, *args, **kwargs):
+        """
+        Override create() so we can return the full read serializer payload
+        (with video_url, thumbnail_url, etc.) rather than the write payload.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = self.perform_create(serializer)
+        read_serializer = ShortVideoSerializer(
+            instance, context={'request': request}
+        )
+        return Response(read_serializer.data, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
         video_file      = self.request.FILES.get('video')
@@ -213,24 +242,22 @@ class ShortVideoUploadView(generics.CreateAPIView):
 
         try:
             if video_file:
-                # ── 1. Write upload to temp ──────────────────────────────
+                # 1. Write upload to temp
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
                     for chunk in video_file.chunks():
                         tmp.write(chunk)
                     tmp_path = tmp.name
 
-                # ── 2. Compress + +faststart ─────────────────────────────
+                # 2. Compress + +faststart
                 compressed_path = tmp_path + '_compressed.mp4'
                 compress_video(tmp_path, compressed_path)
 
-                # ── 3. Extract duration from compressed output ───────────
+                # 3. Extract duration from compressed output
                 duration = extract_duration(compressed_path)
 
-                # ── 4. Re-open compressed file and hand it to the serializer
-                #       so Django's storage backend saves it to GCS / local.
+                # 4. Build InMemoryUploadedFile from compressed bytes and save
+                #    via the serializer so the storage backend handles the path.
                 with open(compressed_path, 'rb') as cf:
-                    from django.core.files.uploadedfile import InMemoryUploadedFile
-                    import io
                     compressed_content = cf.read()
 
                 compressed_file = InMemoryUploadedFile(
@@ -242,26 +269,38 @@ class ShortVideoUploadView(generics.CreateAPIView):
                     charset=None,
                 )
 
+                # FIX-1: pass video= through validated_data, not as a raw kwarg
+                # to Model.save(); this goes through the serializer field so
+                # any storage-backend hooks (S3 upload, path generation) run.
                 instance = serializer.save(
                     author=self.request.user,
                     duration=duration,
                     video=compressed_file,
                 )
 
-                # ── 5. Auto-generate thumbnail if none uploaded ──────────
+                # 5. Auto-generate thumbnail if none was uploaded
                 if compressed_path and not instance.thumbnail:
-                    thumb_bytes = generate_thumbnail(compressed_path)
-                    instance.thumbnail.save(
-                        f'thumb_{instance.pk}.jpg',
-                        ContentFile(thumb_bytes),
-                        save=True,
-                    )
+                    try:
+                        thumb_bytes = generate_thumbnail(compressed_path)
+                        instance.thumbnail.save(
+                            f'thumb_{instance.pk}.jpg',
+                            ContentFile(thumb_bytes),
+                            save=True,
+                        )
+                    except Exception:
+                        # Thumbnail generation is non-fatal
+                        pass
+
             else:
-                # No video file provided — save with whatever fields were sent
-                serializer.save(author=self.request.user, duration=duration)
+                # No video file — save metadata fields only
+                instance = serializer.save(
+                    author=self.request.user,
+                    duration=duration,
+                )
+
+            return instance
 
         finally:
-            # Always clean up temp files
             for path in (tmp_path, compressed_path):
                 if path and os.path.exists(path):
                     try:
@@ -271,7 +310,7 @@ class ShortVideoUploadView(generics.CreateAPIView):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — Feed pagination (Twitter-style LimitOffset)
+# FEED PAGINATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ShortVideoPagination(LimitOffsetPagination):
@@ -289,9 +328,9 @@ class ShortVideoPagination(LimitOffsetPagination):
         "results":  [...]
       }
 
-    The `next` URL is what React Native's FlatList uses to fetch the next page
-    (infinite scroll). Keeping default_limit at 10 keeps the initial payload
-    small so the first screen renders fast.
+    FIX-5: The feed algorithm now fetches FEED_FETCH_SIZE candidates (default
+    200) rather than page-size candidates. This class does all slicing, so
+    page 2+ gets real results instead of an empty list.
     """
     default_limit = 10
     max_limit     = 20
@@ -301,27 +340,28 @@ class ShortVideoFeedView(ListAPIView):
     """
     GET /api/videos/shorts/feed/
 
-    Personalised short-video feed — all videos come from our database.
-    Supports videos up to 2 hours (7200 seconds).
+    Personalised short-video feed.
 
     Query params
     ────────────
     limit        : int (default 10, max 20)
-    offset       : int (default 0)  — standard LimitOffset pagination
+    offset       : int (default 0)
     bypass_cache : any value → forces a fresh score computation
+
+    FIX-5: get_queryset() no longer passes `limit` to get_short_video_feed().
+    The algorithm always returns FEED_FETCH_SIZE scored candidates; the
+    paginator slices them. Previously the algorithm sliced to page size first,
+    so offset=10 always returned 0 rows.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
     serializer_class       = ShortVideoSerializer
-    pagination_class       = ShortVideoPagination   # ← STEP 4
+    pagination_class       = ShortVideoPagination
 
     def get_queryset(self):
-        limit  = min(
-            int(self.request.query_params.get('limit', 10)),
-            ShortVideoPagination.max_limit,
-        )
         bypass = bool(self.request.query_params.get('bypass_cache', False))
-        return get_short_video_feed(self.request.user, limit=limit, bypass_cache=bypass)
+        # FIX-5: do NOT pass limit here — paginator slices the full scored list
+        return get_short_video_feed(self.request.user, bypass_cache=bypass)
 
     def get_serializer_context(self):
         ctx = super().get_serializer_context()
@@ -329,11 +369,6 @@ class ShortVideoFeedView(ListAPIView):
         return ctx
 
     def list(self, request, *args, **kwargs):
-        """
-        Override list() so that:
-        - If pagination is active  → returns { count, next, previous, results }
-        - If pagination is skipped → falls back to { results, count }
-        """
         qs   = self.get_queryset()
         page = self.paginate_queryset(list(qs))
 
@@ -361,30 +396,27 @@ class ShortVideoStreamView(APIView):
     GET /api/videos/shorts/<pk>/stream/
     GET /api/videos/shorts/<pk>/stream/?token=<drf_token_key>
 
-    HTTP Range-aware video streaming.
-    Supports seeking, progressive playback, and resume after network drops.
+    HTTP Range-aware video streaming. Supports seeking, progressive playback,
+    and resume after network drops.
 
     Authentication
     ──────────────
-    Standard: Authorization: Token <key> header (handled by TokenAuthentication).
+    Standard: Authorization: Token <key> header (TokenAuthentication).
 
     Query-param fallback: ?token=<key>
-    react-native-video cannot attach custom headers to a video src URL.
-    If no Authorization header is present, we manually look up the token from
-    the query param and authenticate the user that way.
+    react-native-video cannot attach custom headers to a video src URL, so the
+    serializer embeds the token as a query param. We look it up manually here.
 
-    IMPORTANT: permission_classes is intentionally empty here. DRF's permission
-    check runs before our view code, so we cannot use IsAuthenticated — it would
-    reject ?token= requests before our fallback logic runs. Authentication is
-    enforced manually at the bottom of this method instead.
+    permission_classes is intentionally empty — DRF permission checks run
+    before view code, so IsAuthenticated would reject ?token= requests before
+    our fallback logic can run. Auth is enforced manually below.
     """
     authentication_classes = [TokenAuthentication]
-    permission_classes     = []   # Auth enforced manually below — see docstring
+    permission_classes     = []
 
     def get(self, request, pk):
         user = request.user
 
-        # ── Query-param token fallback for react-native-video ─────────────
         if not user or not user.is_authenticated:
             token_key = request.query_params.get('token', '').strip()
             if token_key:
@@ -397,7 +429,6 @@ class ShortVideoStreamView(APIView):
                         status=status.HTTP_401_UNAUTHORIZED,
                     )
 
-        # ── Final auth gate ───────────────────────────────────────────────
         if not user or not user.is_authenticated:
             return Response(
                 {'detail': 'Authentication credentials were not provided.'},
@@ -414,9 +445,11 @@ class ShortVideoStreamView(APIView):
 
 class VideoLikeToggleView(APIView):
     """
-    POST /api/videos/shorts/<pk>/like/
-    Toggles like. Returns { liked, likes_count }.
-    The cached_likes counter is kept in sync by signals.py.
+    POST   /api/videos/shorts/<pk>/like/  — toggle like on/off
+    DELETE /api/videos/shorts/<pk>/like/  — explicit unlike
+
+    Returns { liked: bool, likes_count: int }.
+    cached_likes is kept in sync by signals.py.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
@@ -439,13 +472,19 @@ class VideoLikeToggleView(APIView):
         )
 
     def delete(self, request, pk):
+        """
+        Explicit DELETE unlike.
+        FIX-3: Returns HTTP 200 with JSON body instead of 204 No Content.
+        HTTP 204 must have no response body; returning one causes some clients
+        to silently drop the data.
+        """
         video = get_object_or_404(ShortVideo, pk=pk)
         deleted, _ = VideoLike.objects.filter(user=request.user, video=video).delete()
         video.refresh_from_db(fields=['cached_likes'])
         if deleted:
-            return Response(
+            return Response(               # FIX-3: was HTTP_204_NO_CONTENT
                 {'liked': False, 'likes_count': video.cached_likes},
-                status=status.HTTP_204_NO_CONTENT,
+                status=status.HTTP_200_OK,
             )
         return Response({'detail': 'Not liked.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -459,8 +498,8 @@ class VideoViewRecordView(APIView):
     POST /api/videos/shorts/<pk>/view/
     Body: { "watch_time": <seconds_float> }
 
-    Records one view event. The player calls this when the user leaves,
-    pauses, or completes the video. Supports watch_time up to 7200s (2 hrs).
+    Records one view event. Supports watch_time up to 7200 s (2 hrs).
+    `completed` is computed server-side in VideoView.save().
     """
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
@@ -483,7 +522,12 @@ class VideoShareRecordView(APIView):
     """
     POST /api/videos/shorts/<pk>/share/
     Body: { "platform": "whatsapp" }  (see VideoShare.PLATFORM_CHOICES)
-    Records a share event and returns the platform-specific share payload.
+
+    Records an external share event and returns platform-specific share URLs.
+
+    FIX-4: WhatsApp, Telegram, and Twitter URL parameters are now properly
+    URL-encoded via urllib.parse.quote so multi-line share text and special
+    characters (emoji, &, #, etc.) don't break the resulting URLs.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
@@ -511,20 +555,25 @@ class VideoShareRecordView(APIView):
         if platform == 'whatsapp':
             text = build_whatsapp_share_text(video)
             payload['text']         = text
-            payload['whatsapp_url'] = f"https://wa.me/?text={text}"
+            # FIX-4: was f"...?text={text}" — unencoded multi-line string
+            payload['whatsapp_url'] = f"https://wa.me/?text={quote(text)}"
 
         elif platform == 'telegram':
             text = build_telegram_share_text(video)
             payload['text']         = text
+            # FIX-4: encode both url and text params
             payload['telegram_url'] = (
-                f"https://t.me/share/url?url={video.share_url}"
-                f"&text={video.og_title}"
+                f"https://t.me/share/url"
+                f"?url={quote(video.share_url, safe='')}"
+                f"&text={quote(video.og_title, safe='')}"
             )
 
         elif platform == 'twitter':
+            # FIX-4: encode url and text params
             payload['twitter_url'] = (
                 f"https://twitter.com/intent/tweet"
-                f"?url={video.share_url}&text={video.og_title}"
+                f"?url={quote(video.share_url, safe='')}"
+                f"&text={quote(video.og_title, safe='')}"
             )
 
         else:
@@ -540,11 +589,21 @@ class VideoShareRecordView(APIView):
 class VideoReshareView(APIView):
     """
     POST /api/videos/shorts/<pk>/reshare/
-    In-app reshare — appears on the resharer's profile feed.
-    Calling again undoes the reshare (toggle).
+
+    In-app reshare toggle — appears on the resharer's profile feed.
+    Calling again undoes the reshare.
+
+    FIX-2: Now uses platform='reshare' (a dedicated PLATFORM_CHOICES entry in
+    models.py) instead of platform='other'. The old code used 'other', which
+    is also the catch-all for any external share that doesn't match a known
+    platform. A user who did an external 'other' share would accidentally have
+    their reshare toggled off the next time they hit this endpoint.
     """
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
+
+    # The dedicated platform value — matches VideoShare.PLATFORM_CHOICES
+    RESHARE_PLATFORM = 'reshare'
 
     def post(self, request, pk):
         video = get_object_or_404(ShortVideo, pk=pk)
@@ -552,7 +611,7 @@ class VideoReshareView(APIView):
         existing = VideoShare.objects.filter(
             user=request.user,
             video=video,
-            platform='other',
+            platform=self.RESHARE_PLATFORM,   # FIX-2: was 'other'
         ).first()
 
         if existing:
@@ -562,7 +621,7 @@ class VideoReshareView(APIView):
         VideoShare.objects.create(
             user=request.user,
             video=video,
-            platform='other',
+            platform=self.RESHARE_PLATFORM,   # FIX-2: was 'other'
         )
         return Response({'reshared': True}, status=status.HTTP_201_CREATED)
 
@@ -576,7 +635,7 @@ class VideoCommentListCreateView(APIView):
     GET  /api/videos/shorts/<pk>/comments/   list top-level comments
     POST /api/videos/shorts/<pk>/comments/   create a comment
 
-    Body fields:
+    POST body fields:
       body    (required) : comment text, may include @username tokens
       parent  (optional) : UUID of the comment being replied to
     """
@@ -588,7 +647,7 @@ class VideoCommentListCreateView(APIView):
         comments = (
             VideoComment.objects
             .filter(video=video, parent__isnull=True)
-            .select_related('author')
+            .select_related('author', 'author__profile')
             .prefetch_related('mentions__user', 'replies')
             .order_by('created_at')
         )
@@ -605,7 +664,6 @@ class VideoCommentListCreateView(APIView):
         )
         serializer.is_valid(raise_exception=True)
         comment = serializer.save(author=request.user)
-
         read_serializer = VideoCommentSerializer(
             comment, context={'request': request}
         )
@@ -626,7 +684,7 @@ class CommentRepliesListView(ListAPIView):
         return (
             VideoComment.objects
             .filter(video_id=video_pk, parent_id=comment_pk)
-            .select_related('author')
+            .select_related('author', 'author__profile')
             .prefetch_related('mentions__user')
             .order_by('created_at')
         )
