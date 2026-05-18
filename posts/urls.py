@@ -31,8 +31,11 @@ router.register(
     basename='short',
 )
 
+# Renamed prefix: 'comments' → 'post-comments' to avoid operationId
+# collision with the nested comments action on PostViewSet
+# (POST /posts/{id}/comments/ vs POST /posts/comments/).
 router.register(
-    r'comments',
+    r'post-comments',
     CommentViewSet,
     basename='comment',
 )
@@ -43,7 +46,8 @@ router.register(
     basename='hashtag',
 )
 
-# Main posts endpoint
+# Main posts endpoint — must be last so its empty prefix r''
+# doesn't swallow the other registrations above.
 router.register(
     r'',
     PostViewSet,
@@ -86,8 +90,10 @@ urlpatterns = [
     ),
 
     # ── SHARE REDIRECT ────────────────────────────────────────────
+    # Using <int:post_id> for numeric IDs; keep <str:post_type> for
+    # the type slug (e.g. "post", "short").
     path(
-        'share/<str:post_type>/<str:post_id>/',
+        'share/<str:post_type>/<int:post_id>/',
         ShareRedirectView.as_view(),
         name='share-redirect',
     ),

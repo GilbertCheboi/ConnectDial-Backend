@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from dj_rest_auth.serializers import LoginSerializer
+from drf_spectacular.utils import extend_schema_field
 
 from .models import User, FanPreference, Profile, Follow
 from leagues.models import League, Team
@@ -37,6 +38,7 @@ class UserSerializer(serializers.ModelSerializer):
             'is_onboarded',
         ]
 
+    @extend_schema_field(serializers.BooleanField())
     def get_is_onboarded(self, obj):
         if obj.account_type in ['news', 'organization']:
             return True
@@ -157,15 +159,18 @@ class ProfileSerializer(serializers.ModelSerializer):
             'is_following', 'followers_count', 'following_count',
         ]
 
+    @extend_schema_field(serializers.BooleanField())
     def get_is_following(self, obj):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             return Follow.objects.filter(follower=request.user, followed=obj.user).exists()
         return False
 
+    @extend_schema_field(serializers.IntegerField())
     def get_followers_count(self, obj):
         return obj.user.followers.count()
 
+    @extend_schema_field(serializers.IntegerField())
     def get_following_count(self, obj):
         return obj.user.following.count()
 

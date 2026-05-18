@@ -31,6 +31,7 @@ from datetime import timedelta
 import traceback
 from django.core.mail import send_mail
 from django.core.validators import validate_email
+from django.template.loader import render_to_string
 from django.utils import timezone
 from django.conf import settings
 from django.db.models.signals import post_save
@@ -45,6 +46,8 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.authtoken.models import Token
 from rest_framework.throttling import AnonRateThrottle
+from drf_spectacular.utils import extend_schema, inline_serializer, OpenApiResponse
+from rest_framework import serializers as drf_serializers
 
 from dj_rest_auth.views import LoginView
 from allauth.socialaccount.models import SocialAccount
@@ -63,6 +66,24 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# REUSABLE INLINE SCHEMAS FOR extend_schema
+# ─────────────────────────────────────────────
+
+_detail_response = inline_serializer(
+    name='DetailResponse',
+    fields={'detail': drf_serializers.CharField()},
+)
+
+_token_schema = inline_serializer(
+    name='TokenResponse',
+    fields={
+        'key':  drf_serializers.CharField(),
+        'user': drf_serializers.DictField(),
+    },
+)
+
 
 # ─────────────────────────────────────────────
 # AUTO-CREATE PROFILE ON USER CREATION
@@ -127,25 +148,15 @@ def generate_otp(length=6):
     return "".join(random.choices(string.digits, k=length))
 
 
-from django.template.loader import render_to_string
-from django.core.mail import send_mail
-
 def send_otp_email(user, otp_code, subject, purpose_label):
-    """Send HTML email with OTP"""
-    context = {
-        'user': user,
-        'otp': otp_code,
-    }
-
+    """Send HTML OTP email."""
+    context = {'user': user, 'otp': otp_code}
     html_message = render_to_string('emails/password_reset_otp.html', context)
-    plain_message = f"""
-    Hi {user.username or user.email},
-
-    Your password reset code is: {otp_code}
-
-    This code expires in 15 minutes.
-    """
-
+    plain_message = (
+        f"Hi {user.username or user.email},\n\n"
+        f"Your {purpose_label} code is: {otp_code}\n\n"
+        f"This code expires in 15 minutes."
+    )
     send_mail(
         subject=subject,
         message=plain_message,
@@ -155,11 +166,13 @@ def send_otp_email(user, otp_code, subject, purpose_label):
         fail_silently=False,
     )
 
+
 OTP_PURPOSE_META = {
     'login':          {'label': 'one-time login',     'subject': 'Your Login OTP'},
     'password_reset': {'label': 'password reset',     'subject': 'Password Reset OTP'},
     'email_verify':   {'label': 'email verification', 'subject': 'Verify Your Email'},
 }
+
 
 def _otp_meta(purpose: str) -> dict:
     return OTP_PURPOSE_META.get(
@@ -177,7 +190,6 @@ def _issue_signed_reset_token(user) -> str:
     timestamp = int(timezone.now().timestamp())
     payload   = f"{user.id}:{timestamp}".encode()
     secret    = settings.SECRET_KEY.encode()
-    # FIX: use positional arg instead of digestmod= keyword for full Python 3 compatibility
     signature = hmac.new(secret, payload, hashlib.sha256).hexdigest()
     return f"{user.id}:{timestamp}:{signature}"
 
@@ -195,7 +207,6 @@ def _decode_signed_reset_token(raw_token: str):
         user_id, timestamp, signature = parts
         payload      = f"{user_id}:{timestamp}".encode()
         secret       = settings.SECRET_KEY.encode()
-        # FIX: use positional arg instead of digestmod= keyword for full Python 3 compatibility
         expected_sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(expected_sig, signature):
@@ -287,11 +298,10 @@ def _token_response(user, extra=None):
     return payload
 
 
-
 def send_welcome_email(user):
-    """Send welcome email only once per user"""
+    """Send welcome email only once per user."""
     if not user or not user.email:
-        logger.warning(f"Cannot send welcome email - user or email missing")
+        logger.warning("Cannot send welcome email - user or email missing")
         return
 
     profile, _ = Profile.objects.get_or_create(user=user)
@@ -301,21 +311,14 @@ def send_welcome_email(user):
         return
 
     try:
-        context = {'user': user}
-
+        context      = {'user': user}
         html_message = render_to_string('emails/welcome_onboarding.html', context)
-
-        plain_message = f"""
-        Hi {user.username or user.email},
-
-        Welcome to ConnectDial! 🎉
-
-        Please complete your profile to get the best experience.
-
-        Best regards,
-        The ConnectDial Team
-        """
-
+        plain_message = (
+            f"Hi {user.username or user.email},\n\n"
+            f"Welcome to ConnectDial! 🎉\n\n"
+            f"Please complete your profile to get the best experience.\n\n"
+            f"Best regards,\nThe ConnectDial Team"
+        )
         send_mail(
             subject='Welcome to ConnectDial! Complete Your Profile',
             message=plain_message,
@@ -324,19 +327,29 @@ def send_welcome_email(user):
             html_message=html_message,
             fail_silently=False,
         )
-
         profile.welcome_email_sent = True
         profile.save(update_fields=['welcome_email_sent'])
+        logger.info(f"Welcome email sent successfully to {user.email}")
 
-        logger.info(f"✅ Welcome email sent successfully to {user.email}")
-
-    except Exception as e:
+    except Exception:
         logger.error(f"Failed to send welcome email to {user.email}")
         logger.error(traceback.format_exc())
+
+
 # ─────────────────────────────────────────────
 # EMAIL VERIFICATION
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Send Email Verification OTP",
+    description="Send a 6-digit OTP to the authenticated user's email for verification.",
+    request=None,
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["Email Verification"],
+)
 class SendEmailVerificationView(APIView):
     """POST /auth/email/send-verification/"""
     authentication_classes = [TokenAuthentication]
@@ -364,6 +377,19 @@ class SendEmailVerificationView(APIView):
         return Response({"detail": "Verification OTP sent to your email."}, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Verify Email via OTP",
+    description="Submit the OTP sent to the authenticated user's email to mark it as verified.",
+    request=inline_serializer(
+        name='VerifyEmailRequest',
+        fields={'otp': drf_serializers.CharField()},
+    ),
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["Email Verification"],
+)
 class VerifyEmailView(APIView):
     """POST /auth/email/verify/ — Body: { "otp": "123456" }"""
     authentication_classes = [TokenAuthentication]
@@ -397,6 +423,19 @@ class VerifyEmailView(APIView):
 # OTP — GENERIC SEND & VERIFY
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Send OTP",
+    description="Send a one-time password to the given email for the specified purpose (login, password_reset, email_verify).",
+    request=inline_serializer(
+        name='SendOTPRequest',
+        fields={
+            'email':   drf_serializers.EmailField(),
+            'purpose': drf_serializers.CharField(default='login'),
+        },
+    ),
+    responses={200: _detail_response},
+    tags=["OTP"],
+)
 class SendOTPView(APIView):
     """
     POST /auth/otp/send/
@@ -434,6 +473,35 @@ class SendOTPView(APIView):
         return generic_response
 
 
+@extend_schema(
+    summary="Verify OTP",
+    description=(
+        "Verify a one-time password. "
+        "Returns a reset_token for password_reset, marks email verified for email_verify, "
+        "or returns an auth token for login."
+    ),
+    request=inline_serializer(
+        name='VerifyOTPRequest',
+        fields={
+            'identifier': drf_serializers.CharField(),
+            'otp':        drf_serializers.CharField(),
+            'purpose':    drf_serializers.CharField(default='login'),
+        },
+    ),
+    responses={
+        200: inline_serializer(
+            name='VerifyOTPResponse',
+            fields={
+                'key':         drf_serializers.CharField(required=False),
+                'reset_token': drf_serializers.CharField(required=False),
+                'detail':      drf_serializers.CharField(required=False),
+                'user':        drf_serializers.DictField(required=False),
+            },
+        ),
+        400: _detail_response,
+    },
+    tags=["OTP"],
+)
 class VerifyOTPView(APIView):
     """
     POST /auth/otp/verify/
@@ -467,7 +535,6 @@ class VerifyOTPView(APIView):
             return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
         otp_obj.delete()
-
         ip = _get_client_ip(request)
 
         if purpose == 'password_reset':
@@ -495,8 +562,18 @@ class VerifyOTPView(APIView):
 # FORGOT PASSWORD
 # ─────────────────────────────────────────────
 
-# Optimal Backend Update in views.py
+@extend_schema(
+    summary="Forgot Password",
+    description="Send a password reset OTP to the user's email. Accepts email or username.",
+    request=inline_serializer(
+        name='ForgotPasswordRequest',
+        fields={'email': drf_serializers.CharField()},
+    ),
+    responses={200: _detail_response},
+    tags=["Password"],
+)
 class ForgotPasswordView(APIView):
+    """POST /auth/password/forgot/"""
     permission_classes = [AllowAny]
     throttle_classes   = [PasswordResetThrottle]
 
@@ -504,8 +581,10 @@ class ForgotPasswordView(APIView):
         identifier = request.data.get("email", "").strip()
 
         if not identifier:
-            return Response({"detail": "Email or username is required."}, 
-                          status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Email or username is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         generic_response = Response(
             {"detail": "If that account exists, a reset OTP has been sent."},
@@ -516,7 +595,6 @@ class ForgotPasswordView(APIView):
         if not user:
             return generic_response
 
-        # Safety check
         if not user.email:
             logger.error(f"User {user.username} has no email address")
             return generic_response
@@ -524,24 +602,39 @@ class ForgotPasswordView(APIView):
         otp = generate_otp()
         OTPCode.objects.filter(user=user, purpose="password_reset").delete()
         OTPCode.objects.create(
-            user=user, 
-            code=otp, 
+            user=user,
+            code=otp,
             purpose="password_reset",
             expires_at=timezone.now() + timedelta(minutes=15),
         )
 
         meta = _otp_meta("password_reset")
-
-        # === CRITICAL: Catch email errors ===
         try:
             send_otp_email(user, otp, subject=meta['subject'], purpose_label=meta['label'])
             logger.info(f"Password reset OTP sent to {user.email}")
-        except Exception as e:
+        except Exception:
             logger.error(f"Failed to send password reset email to {user.email}")
             logger.error(traceback.format_exc())
-            # Still return success message (security best practice)
 
         return generic_response
+
+
+@extend_schema(
+    summary="Reset Password",
+    description="Reset the user's password using a signed reset token obtained after OTP verification.",
+    request=inline_serializer(
+        name='ResetPasswordRequest',
+        fields={
+            'reset_token':  drf_serializers.CharField(),
+            'new_password': drf_serializers.CharField(),
+        },
+    ),
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["Password"],
+)
 class ResetPasswordView(APIView):
     """POST /auth/password/reset/"""
     permission_classes = [AllowAny]
@@ -551,10 +644,16 @@ class ResetPasswordView(APIView):
         new_password = request.data.get("new_password", "").strip()
 
         if not raw_token or not new_password:
-            return Response({"detail": "reset_token and new_password are both required."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "reset_token and new_password are both required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if len(new_password) < 8:
-            return Response({"detail": "Password must be at least 8 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Password must be at least 8 characters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             user = _decode_signed_reset_token(raw_token)
@@ -578,6 +677,28 @@ class ResetPasswordView(APIView):
 # CHANGE PASSWORD (authenticated)
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Change Password",
+    description="Change password for the authenticated user. Returns a new auth token.",
+    request=inline_serializer(
+        name='ChangePasswordRequest',
+        fields={
+            'old_password': drf_serializers.CharField(),
+            'new_password': drf_serializers.CharField(),
+        },
+    ),
+    responses={
+        200: inline_serializer(
+            name='ChangePasswordResponse',
+            fields={
+                'detail': drf_serializers.CharField(),
+                'key':    drf_serializers.CharField(),
+            },
+        ),
+        400: _detail_response,
+    },
+    tags=["Password"],
+)
 class ChangePasswordView(APIView):
     """POST /auth/password/change/ — Body: { "old_password": "...", "new_password": "..." }"""
     authentication_classes = [TokenAuthentication]
@@ -594,10 +715,16 @@ class ChangePasswordView(APIView):
             )
 
         if not request.user.check_password(old_password):
-            return Response({"detail": "Current password is incorrect."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Current password is incorrect."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         if len(new_password) < 8:
-            return Response({"detail": "New password must be at least 8 characters."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "New password must be at least 8 characters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         request.user.set_password(new_password)
         request.user.save()
@@ -615,6 +742,22 @@ class ChangePasswordView(APIView):
 # 2FA — TOTP
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Setup 2FA",
+    description="Generate a TOTP secret and QR code to begin 2FA enrollment.",
+    request=None,
+    responses={
+        200: inline_serializer(
+            name='Setup2FAResponse',
+            fields={
+                'secret':  drf_serializers.CharField(),
+                'qr_code': drf_serializers.CharField(),
+                'detail':  drf_serializers.CharField(),
+            },
+        ),
+    },
+    tags=["2FA"],
+)
 class Setup2FAView(APIView):
     """POST /auth/2fa/setup/"""
     authentication_classes = [TokenAuthentication]
@@ -647,6 +790,19 @@ class Setup2FAView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Verify 2FA Setup",
+    description="Confirm the TOTP code from the authenticator app to activate 2FA.",
+    request=inline_serializer(
+        name='Verify2FASetupRequest',
+        fields={'totp_code': drf_serializers.CharField()},
+    ),
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["2FA"],
+)
 class Verify2FASetupView(APIView):
     """POST /auth/2fa/verify-setup/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
@@ -670,6 +826,19 @@ class Verify2FASetupView(APIView):
         return Response({"detail": "2FA enabled successfully."}, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Validate 2FA Code",
+    description="Validate a TOTP code for an already-enrolled user.",
+    request=inline_serializer(
+        name='Validate2FARequest',
+        fields={'totp_code': drf_serializers.CharField()},
+    ),
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["2FA"],
+)
 class Validate2FAView(APIView):
     """POST /auth/2fa/validate/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
@@ -688,6 +857,19 @@ class Validate2FAView(APIView):
         return Response({"detail": "2FA verified. Access granted."}, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Disable 2FA",
+    description="Disable 2FA for the authenticated user. Requires a valid TOTP code to confirm.",
+    request=inline_serializer(
+        name='Disable2FARequest',
+        fields={'totp_code': drf_serializers.CharField()},
+    ),
+    responses={
+        200: _detail_response,
+        400: _detail_response,
+    },
+    tags=["2FA"],
+)
 class Disable2FAView(APIView):
     """POST /auth/2fa/disable/ — Body: { "totp_code": "123456" }"""
     authentication_classes = [TokenAuthentication]
@@ -701,7 +883,10 @@ class Disable2FAView(APIView):
             return Response({"detail": "2FA is not currently enabled."}, status=status.HTTP_400_BAD_REQUEST)
 
         if not pyotp.TOTP(profile.totp_secret).verify(totp_code, valid_window=1):
-            return Response({"detail": "Invalid TOTP code. 2FA was NOT disabled."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "Invalid TOTP code. 2FA was NOT disabled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         profile.two_fa_enabled = False
         profile.totp_secret    = None
@@ -709,6 +894,20 @@ class Disable2FAView(APIView):
         return Response({"detail": "2FA disabled."}, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    summary="Get 2FA Status",
+    description="Return whether 2FA and email verification are enabled for the authenticated user.",
+    responses={
+        200: inline_serializer(
+            name='Get2FAStatusResponse',
+            fields={
+                'two_fa_enabled': drf_serializers.BooleanField(),
+                'email_verified': drf_serializers.BooleanField(),
+            },
+        ),
+    },
+    tags=["2FA"],
+)
 class Get2FAStatusView(APIView):
     """GET /auth/2fa/status/"""
     authentication_classes = [TokenAuthentication]
@@ -730,15 +929,15 @@ class Get2FAStatusView(APIView):
     summary="Check Token Validity",
     description="Verify if the current token is valid and return user info.",
     responses={
-        200: {
-            "type": "object",
-            "properties": {
-                "valid": {"type": "boolean"},
-                "user": {"type": "object"}
-            }
-        }
+        200: inline_serializer(
+            name='CheckTokenResponse',
+            fields={
+                'valid': drf_serializers.BooleanField(),
+                'user':  drf_serializers.DictField(),
+            },
+        ),
     },
-    tags=["Auth"]
+    tags=["Auth"],
 )
 class CheckTokenView(APIView):
     """GET /auth/token/check/"""
@@ -755,20 +954,27 @@ class CheckTokenView(APIView):
 # ─────────────────────────────────────────────
 # GOOGLE SIGN-IN (DRF Token)
 # ─────────────────────────────────────────────
+
 @extend_schema(
     summary="Google Sign In",
-    description="Authenticate user with Google ID token.",
-    request={
-        "application/json": {
-            "type": "object",
-            "properties": {
-                "id_token": {"type": "string", "example": "eyJhbGciOiJSUzI1NiIs..."}
+    description="Authenticate or register a user using a Google ID token.",
+    request=inline_serializer(
+        name='GoogleSignInRequest',
+        fields={'id_token': drf_serializers.CharField()},
+    ),
+    responses={
+        200: inline_serializer(
+            name='GoogleSignInResponse',
+            fields={
+                'key':          drf_serializers.CharField(),
+                'user':         drf_serializers.DictField(),
+                'is_new_user':  drf_serializers.BooleanField(),
             },
-            "required": ["id_token"]
-        }
+        ),
+        400: _detail_response,
+        401: _detail_response,
     },
-    responses={200: {"type": "object", "properties": {"key": {"type": "string"}, "user": {"type": "object"}}}},
-    tags=["Auth"]
+    tags=["Auth"],
 )
 class GoogleSignInView(APIView):
     """POST /auth/social/google/"""
@@ -780,7 +986,6 @@ class GoogleSignInView(APIView):
         if not raw_token:
             return Response({'error': 'id_token is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Collect all valid client IDs — web is required, Android/iOS are optional
         web_client_id     = getattr(settings, 'GOOGLE_CLIENT_ID', '')
         android_client_id = getattr(settings, 'GOOGLE_ANDROID_CLIENT_ID', '')
         ios_client_id     = getattr(settings, 'GOOGLE_IOS_CLIENT_ID', '')
@@ -795,7 +1000,6 @@ class GoogleSignInView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Try verifying against each registered client ID
         idinfo     = None
         last_error = None
 
@@ -804,7 +1008,7 @@ class GoogleSignInView(APIView):
                 idinfo = google_id_token.verify_oauth2_token(
                     raw_token, google_requests.Request(), cid
                 )
-                break  # Successfully verified
+                break
             except ValueError as e:
                 last_error = e
                 continue
@@ -815,9 +1019,6 @@ class GoogleSignInView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # Extra safety: ensure aud or azp matches one of our registered client IDs.
-        # Android tokens have aud = web_client_id and azp = android_client_id.
-        # iOS tokens have aud = ios_client_id.
         token_aud = idinfo.get('aud', '')
         token_azp = idinfo.get('azp', '')
         if token_aud not in valid_client_ids and token_azp not in valid_client_ids:
@@ -832,8 +1033,6 @@ class GoogleSignInView(APIView):
                 {'error': 'Invalid or unverified Google email.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
-                # ... existing code ...
 
         try:
             user    = User.objects.get(email__iexact=email)
@@ -854,7 +1053,6 @@ class GoogleSignInView(APIView):
         SocialAccount.objects.get_or_create(user=user, provider='google', uid=idinfo['sub'])
         _log_login(user, request)
 
-        # Send welcome email ONLY for first-time users and only once
         if created:
             send_welcome_email(user)
 
@@ -867,29 +1065,38 @@ class GoogleSignInView(APIView):
 # ─────────────────────────────────────────────
 # FOLLOW / UNFOLLOW
 # ─────────────────────────────────────────────
+
 @extend_schema(
     summary="Toggle Follow User",
-    description="Follow or unfollow a user.",
+    description="Follow a user if not already following, or unfollow if already following.",
     request=None,
     responses={
-        200: {
-            "type": "object",
-            "properties": {
-                "following": {"type": "boolean"},
-                "message": {"type": "string"},
-                "follower_count": {"type": "integer"}
-            }
-        },
-        201: {"type": "object"},
-        400: {"type": "object"},
-        404: {"type": "object"}
+        200: inline_serializer(
+            name='UnfollowResponse',
+            fields={
+                'following':      drf_serializers.BooleanField(),
+                'message':        drf_serializers.CharField(),
+                'follower_count': drf_serializers.IntegerField(),
+            },
+        ),
+        201: inline_serializer(
+            name='FollowResponse',
+            fields={
+                'following':      drf_serializers.BooleanField(),
+                'message':        drf_serializers.CharField(),
+                'follower_count': drf_serializers.IntegerField(),
+            },
+        ),
+        400: _detail_response,
+        404: _detail_response,
     },
-    tags=["Users"]
+    tags=["Users"],
 )
 class ToggleFollowView(APIView):
     """POST /auth/users/<user_id>/follow/"""
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
+
     def post(self, request, user_id):
         follower = request.user
         try:
@@ -922,7 +1129,6 @@ class ToggleFollowView(APIView):
 # REGISTRATION & ONBOARDING
 # ─────────────────────────────────────────────
 
-
 class RegisterView(generics.CreateAPIView):
     queryset           = User.objects.all()
     serializer_class   = UserSerializer
@@ -930,18 +1136,28 @@ class RegisterView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
-        
+
         if response.status_code == 201:
             user     = User.objects.get(id=response.data['id'])
             token, _ = Token.objects.get_or_create(user=user)
             response.data['token'] = token.key
-
-            # Send welcome email for new registrations
             send_welcome_email(user)
 
         return response
 
+
+@extend_schema(
+    summary="User Onboarding",
+    description="Set account type and fan preferences for the authenticated user.",
+    request=OnboardingSerializer,
+    responses={
+        200: UserSerializer,
+        400: _detail_response,
+    },
+    tags=["Auth"],
+)
 class OnboardingView(APIView):
+    """POST /auth/onboarding/"""
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
 
@@ -1054,6 +1270,13 @@ class CustomLoginView(LoginView):
 # LOGOUT
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Logout",
+    description="Invalidate the current auth token and clear the FCM push token.",
+    request=None,
+    responses={200: _detail_response},
+    tags=["Auth"],
+)
 class LogoutView(APIView):
     """POST /auth/logout/"""
     authentication_classes = [TokenAuthentication]
@@ -1074,6 +1297,7 @@ class LogoutView(APIView):
 # TEST VIEW — Remove before production
 # ─────────────────────────────────────────────
 
+@extend_schema(exclude=True)
 class TestGoogleTokenView(APIView):
     """POST /auth/social/google/test/ — Temporary token debug view."""
     permission_classes = [AllowAny]
@@ -1103,27 +1327,29 @@ class TestGoogleTokenView(APIView):
 
         if idinfo:
             return Response({
-                "valid":   True,
-                "email":   idinfo.get('email'),
-                "name":    idinfo.get('name'),
-                "aud":     idinfo.get('aud'),
-                "azp":     idinfo.get('azp'),
-                "sub":     idinfo.get('sub'),
+                "valid": True,
+                "email": idinfo.get('email'),
+                "name":  idinfo.get('name'),
+                "aud":   idinfo.get('aud'),
+                "azp":   idinfo.get('azp'),
+                "sub":   idinfo.get('sub'),
             }, status=status.HTTP_200_OK)
 
         return Response({
-            "valid": False,
-            "error": str(last_error),
+            "valid":            False,
+            "error":            str(last_error),
             "tried_client_ids": valid_client_ids,
         }, status=status.HTTP_400_BAD_REQUEST)
+
+
 # ─────────────────────────────────────────────
 # FOLLOWERS & FOLLOWING LIST VIEWS
 # ─────────────────────────────────────────────
 
 class UserFollowersListView(generics.ListAPIView):
     """GET /auth/users/<user_id>/followers/"""
-    serializer_class = ProfileSerializer
-    permission_classes = [IsAuthenticated]
+    serializer_class       = ProfileSerializer
+    permission_classes     = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
 
     def get_queryset(self):
@@ -1139,8 +1365,8 @@ class UserFollowersListView(generics.ListAPIView):
 
 class UserFollowingListView(generics.ListAPIView):
     """GET /auth/users/<user_id>/following/"""
-    serializer_class = ProfileSerializer
-    permission_classes = [IsAuthenticated]
+    serializer_class       = ProfileSerializer
+    permission_classes     = [IsAuthenticated]
     authentication_classes = [TokenAuthentication]
 
     def get_queryset(self):
@@ -1152,25 +1378,44 @@ class UserFollowingListView(generics.ListAPIView):
             ).select_related('user')
         except User.DoesNotExist:
             return Profile.objects.none()
+
+
 # ─────────────────────────────────────────────
 # RESEND WELCOME EMAIL (Manual)
 # ─────────────────────────────────────────────
 
+@extend_schema(
+    summary="Resend Welcome Email",
+    description="Resend the welcome/onboarding email to the authenticated user.",
+    request=None,
+    responses={
+        200: inline_serializer(
+            name='ResendWelcomeEmailResponse',
+            fields={
+                'detail': drf_serializers.CharField(),
+                'email':  drf_serializers.EmailField(),
+            },
+        ),
+        400: _detail_response,
+        500: _detail_response,
+    },
+    tags=["Auth"],
+)
 class ResendWelcomeEmailView(APIView):
-    """POST /auth/welcome/resend/ 
-    Allows authenticated users to resend their welcome email"""
+    """POST /auth/welcome/resend/"""
     authentication_classes = [TokenAuthentication]
     permission_classes     = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
+        user       = request.user
         profile, _ = Profile.objects.get_or_create(user=user)
 
         if not user.email:
-            return Response({"detail": "No email address associated with this account."}, 
-                          status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "No email address associated with this account."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # Temporarily allow resend
         was_sent = profile.welcome_email_sent
         profile.welcome_email_sent = False
         profile.save(update_fields=['welcome_email_sent'])
@@ -1179,13 +1424,13 @@ class ResendWelcomeEmailView(APIView):
             send_welcome_email(user)
             return Response({
                 "detail": "Welcome email has been resent successfully.",
-                "email": user.email
+                "email":  user.email,
             }, status=status.HTTP_200_OK)
-        except Exception as e:
-            # Restore flag if sending failed
+        except Exception:
             profile.welcome_email_sent = was_sent
             profile.save(update_fields=['welcome_email_sent'])
             logger.error(f"Resend welcome email failed for {user.email}")
-            return Response({
-                "detail": "Failed to send welcome email. Please try again later."
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {"detail": "Failed to send welcome email. Please try again later."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
