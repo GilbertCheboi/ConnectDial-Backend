@@ -28,7 +28,7 @@ import hmac
 import hashlib
 import logging
 from datetime import timedelta
-
+import traceback
 from django.core.mail import send_mail
 from django.core.validators import validate_email
 from django.utils import timezone
@@ -62,6 +62,7 @@ from .serializers import (
     CustomLoginSerializer,
 )
 
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
 # AUTO-CREATE PROFILE ON USER CREATION
@@ -285,15 +286,15 @@ def _token_response(user, extra=None):
         payload.update(extra)
     return payload
 
-logger = logging.getLogger(__name__)
+
 
 def send_welcome_email(user):
     """Send welcome email only once per user"""
-    if not user.email:
-        logger.warning(f"Cannot send welcome email to user {user.id} - no email")
+    if not user or not user.email:
+        logger.warning(f"Cannot send welcome email - user or email missing")
         return
 
-    profile, created = Profile.objects.get_or_create(user=user)
+    profile, _ = Profile.objects.get_or_create(user=user)
 
     if profile.welcome_email_sent:
         logger.info(f"Welcome email already sent to {user.email} - skipping")
@@ -332,7 +333,6 @@ def send_welcome_email(user):
     except Exception as e:
         logger.error(f"Failed to send welcome email to {user.email}")
         logger.error(traceback.format_exc())
-
 # ─────────────────────────────────────────────
 # EMAIL VERIFICATION
 # ─────────────────────────────────────────────
@@ -883,6 +883,7 @@ class ToggleFollowView(APIView):
 # REGISTRATION & ONBOARDING
 # ─────────────────────────────────────────────
 
+
 class RegisterView(generics.CreateAPIView):
     queryset           = User.objects.all()
     serializer_class   = UserSerializer
@@ -890,12 +891,16 @@ class RegisterView(generics.CreateAPIView):
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
+        
         if response.status_code == 201:
             user     = User.objects.get(id=response.data['id'])
             token, _ = Token.objects.get_or_create(user=user)
             response.data['token'] = token.key
-        return response
 
+            # Send welcome email for new registrations
+            send_welcome_email(user)
+
+        return response
 
 class OnboardingView(APIView):
     authentication_classes = [TokenAuthentication]
