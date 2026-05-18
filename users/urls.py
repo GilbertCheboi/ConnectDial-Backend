@@ -6,6 +6,7 @@ from .views import (
     CustomLoginView,
     LogoutView,
     GoogleSignInView,
+    ResendWelcomeEmailView,
 
     # OTP
     SendOTPView,
@@ -90,4 +91,5 @@ urlpatterns = [
     # password/change/, logout/, etc. never shadow the custom views above.
     path('', include('dj_rest_auth.urls')),
     path('register/', include('dj_rest_auth.registration.urls')),
+    path('welcome/resend/', ResendWelcomeEmailView.as_view(), name='resend-welcome'),
 ]

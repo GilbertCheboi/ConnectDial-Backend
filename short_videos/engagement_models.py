@@ -1,28 +1,41 @@
-class VideoLike(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    video = models.ForeignKey(ShortVideo, related_name='likes', on_delete=models.CASCADE)
-    created_at = models.DateTimeField(auto_now_add=True)
+"""
+ConnectDial — engagement_models.py
+=====================================
+THIS FILE HAS BEEN DELETED.
 
-    class Meta:
-        unique_together = ('user', 'video')
+All engagement models (VideoLike, VideoComment, CommentMention, VideoShare,
+VideoView) now live in models.py, which is the single canonical source of
+truth.
 
+Why it was removed
+──────────────────
+engagement_models.py was a stale duplicate that diverged from models.py:
 
-class VideoComment(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    video = models.ForeignKey(ShortVideo, related_name='comments', on_delete=models.CASCADE)
-    text = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
+  - VideoComment used `text = models.TextField()` here vs
+    `body = models.TextField(db_column='text')` in models.py (with parent,
+    mentioned_users M2M, UUID pk, and threading support).
 
+  - VideoLike, VideoShare, and VideoView were also out of sync.
 
-class VideoShare(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    video = models.ForeignKey(ShortVideo, related_name='shares', on_delete=models.CASCADE)
-    created_at = models.DateTimeField(auto_now_add=True)
+If Django ever registered both files as separate apps/modules, it would raise
+a duplicate model error. If any import pulled from the wrong file, the schema
+mismatch would cause silent data corruption or runtime errors.
 
+Action required
+───────────────
+  1. Delete this file from your repository entirely.
+  2. Ensure all imports point to .models, never to .engagement_models.
 
-class VideoView(models.Model):
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True)
-    video = models.ForeignKey(ShortVideo, related_name='views', on_delete=models.CASCADE)
-    watch_time = models.FloatField(help_text="Seconds watched")
-    created_at = models.DateTimeField(auto_now_add=True)
+     WRONG:  from .engagement_models import VideoLike
+     RIGHT:  from .models import VideoLike
 
+  3. If you have a migration that references engagement_models, rename the
+     app_label in that migration to match the app that owns models.py.
+"""
+
+# This file intentionally left with no importable symbols.
+# Delete it — do not import from it.
+raise ImportError(
+    "engagement_models.py is a stale duplicate and must be deleted. "
+    "Import all engagement models from .models instead."
+)

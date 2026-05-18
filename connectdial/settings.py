@@ -111,13 +111,15 @@ DATABASES = {
 # ======================
 # TEMPLATES
 # ======================
+
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],   # ← Recommended
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
+                'django.template.context_processors.debug',
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
@@ -181,8 +183,7 @@ else:
 # GCS connection tuning
 GS_DEFAULT_TIMEOUT    = 300
 GS_CONNECTION_TIMEOUT = 300
-GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 5  # 5 MB
-
+GS_BLOB_CHUNK_SIZE    = 1024 * 1024 * 16  # 16 MB chunks
 # ======================
 # CORS
 # ======================
