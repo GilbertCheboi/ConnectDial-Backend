@@ -170,41 +170,21 @@ def _extract_media_files(request):
 # ─────────────────────────────────────────────────────────────────────
 class PostViewSet(viewsets.ModelViewSet):
     serializer_class = PostSerializer
-
     pagination_class = FeedCursorPagination
-
     filter_backends = [filters.SearchFilter]
+    search_fields = ['content', 'author__username', 'league__name']
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
-    search_fields = [
-        'content',
-        'author__username',
-        'league__name',
-    ]
-
-    parser_classes = [
-        MultiPartParser,
-        FormParser,
-        JSONParser,
-    ]
-
-    # ─────────────────────────────────────────────────────────────
-    # PERMISSIONS - Fixed for Public Global Feed
-    # ─────────────────────────────────────────────────────────────
     def get_permissions(self):
-        """Global feed and post detail are public. Other actions require auth."""
         if self.action in ['list', 'retrieve']:
             return [permissions.AllowAny()]
         return [permissions.IsAuthenticated(), IsAuthorOrReadOnly()]
 
-    # ─────────────────────────────────────────────────────────────
-    # QUERYSET - Fixed & Safe
-    # ─────────────────────────────────────────────────────────────
     def get_queryset(self):
         user = self.request.user
         params = self.request.query_params
         feed_type = params.get('feed_type', 'global')
 
-        # Safe base queryset
         qs = _base_post_qs(user if user.is_authenticated else None)
 
         user_id = params.get('user')
@@ -212,15 +192,12 @@ class PostViewSet(viewsets.ModelViewSet):
         leagues_list = params.get('leagues')
         team_id = params.get('team')
 
-        # USER PROFILE POSTS
         if user_id:
             return qs.filter(author_id=user_id).order_by('-created_at')
 
-        # TEAM FILTER
         if team_id:
             qs = qs.filter(team_id=team_id)
 
-        # STRICT LEAGUE FEED
         if feed_type == 'league':
             if league_id:
                 qs = qs.filter(league_id=league_id)
@@ -228,33 +205,21 @@ class PostViewSet(viewsets.ModelViewSet):
                 qs = qs.none()
             return qs.order_by('-created_at')
 
-        # GLOBAL FEED - Fixed for anonymous users
         if feed_type == 'global':
             if user.is_authenticated:
-                league_ids = list(
-                    user.fan_preferences.values_list('league_id', flat=True)
-                )
+                league_ids = list(user.fan_preferences.values_list('league_id', flat=True))
                 if league_ids:
                     qs = qs.filter(league_id__in=league_ids)
-                    logger.info("GLOBAL FEED | user=%s | leagues=%s", user.id, league_ids)
             else:
-                # Anonymous users see recent posts from any league
                 qs = qs.filter(league__isnull=False)
             return qs.order_by('-created_at')
 
-        # FOLLOWING FEED (redirect to separate view or handle here)
         if feed_type == 'following':
             if user.is_authenticated:
-                following_ids = Follow.objects.filter(
-                    follower=user
-                ).values_list('followed_id', flat=True)
-                return qs.filter(
-                    Q(author_id__in=following_ids) | Q(author=user)
-                ).order_by('-created_at')
-            else:
-                return qs.none()
+                following_ids = Follow.objects.filter(follower=user).values_list('followed_id', flat=True)
+                return qs.filter(Q(author_id__in=following_ids) | Q(author=user)).order_by('-created_at')
+            return qs.none()
 
-        # LEGACY leagues param
         if leagues_list:
             try:
                 ids = [int(x) for x in leagues_list.split(',') if x.strip()]
