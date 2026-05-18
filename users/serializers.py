@@ -174,7 +174,56 @@ class ProfileSerializer(serializers.ModelSerializer):
     def get_following_count(self, obj):
         return obj.user.following.count()
 
+# ====================== PROFILE SERIALIZER ======================
+from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.types import OpenApiTypes
 
+
+class ProfileSerializer(serializers.ModelSerializer):
+    username        = serializers.ReadOnlyField(source='user.username')
+    user_id         = serializers.ReadOnlyField(source='user.id')
+    fan_preferences = FanPreferenceSerializer(source='user.fan_preferences', many=True, read_only=True)
+
+    is_following    = serializers.SerializerMethodField()
+    followers_count = serializers.SerializerMethodField()
+    following_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Profile
+        fields = [
+            'id', 'user_id', 'username', 'display_name', 'bio',
+            'profile_image', 'banner_image', 'fcm_token',
+            'fan_preferences',
+            'is_following', 'followers_count', 'following_count',
+        ]
+        read_only_fields = ['username', 'is_following', 'followers_count', 'following_count']
+
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def get_is_following(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return False
+        try:
+            return Follow.objects.filter(
+                follower=request.user, 
+                followed=obj.user
+            ).exists()
+        except Exception:
+            return False
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_followers_count(self, obj):
+        try:
+            return obj.user.followers.count()
+        except Exception:
+            return 0
+
+    @extend_schema_field(OpenApiTypes.INT)
+    def get_following_count(self, obj):
+        try:
+            return obj.user.following.count()
+        except Exception:
+            return 0
 # ─────────────────────────────────────────────
 # CUSTOM LOGIN SERIALIZER
 # ─────────────────────────────────────────────
