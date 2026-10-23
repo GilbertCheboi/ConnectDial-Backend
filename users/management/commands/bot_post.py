@@ -460,7 +460,7 @@ class Command(BaseCommand):
     def _fetch_apify_news(self, league_name, team_names):
         """
         Runs the Apify Google News Scraper Actor synchronously.
-        Actor: apify~google-news-scraper
+        Actor: johnvc~GoogleNewsAPI
         Returns list of {text, title} dicts — image fetched separately via Apify Google Images.
         """
         if not APIFY_TOKEN:
@@ -473,22 +473,24 @@ class Command(BaseCommand):
         try:
             # Synchronous run — blocks until done, returns dataset directly
             r = requests.post(
-                "https://api.apify.com/v2/acts/apify~google-news-scraper"
+                "https://api.apify.com/v2/acts/johnvc~GoogleNewsAPI"
                 "/run-sync-get-dataset-items",
                 params={"token": APIFY_TOKEN},
                 json={
-                    "query": query,
-                    "maxItems": 15,
-                    "language": "en",
+                    "q": query,
+                    "hl": "en",
+                    "max_pages": 1,        # one results page, about 10 to 25 articles
+                    "time_range": "week",  # newest first; the 2-day check below still applies
                 },
                 timeout=60,  # Apify may take up to 30s
             )
-            if r.status_code != 200:
+            if r.status_code not in (200, 201):  # run-sync answers 201 Created
                 self.stdout.write(self.style.WARNING(
                     f"  ⚠️  Apify returned HTTP {r.status_code}"
                 ))
                 return []
-            items = r.json()
+            # One dataset item per results page; the articles are in news_results
+            items = [a for page in r.json() for a in (page.get("news_results") or [])]
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  ⚠️  Apify request failed: {e}"))
             return []
@@ -497,7 +499,8 @@ class Command(BaseCommand):
         for item in items:
             title   = self._clean_title(item.get("title", "") or "", item.get("source", "") or "")
             desc    = item.get("description", "") or item.get("snippet", "") or ""
-            pub     = item.get("publishedAt", "") or item.get("date", "") or ""
+            # published_at is "2026-01-11 11:30:00 UTC"; make it ISO for _is_recent
+            pub     = (item.get("published_at", "") or "").replace(" UTC", "+00:00")
             source  = item.get("source", "") or item.get("publisher", "") or ""
 
             if not title or len(title) < 15:
